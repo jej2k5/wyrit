@@ -2,8 +2,10 @@
 
 Do not implement product code.
 
-Validate the governed REA summary and evidence matrix against the complete local REA investigation when available. Import the complete investigation as `docs/research/REA_FULL.md` without changing its evidence labels. Resolve contradictions by documenting them, never by silently rewriting evidence.
+Treat `docs/research/cloudflare-code-mode-rea.md` as the canonical complete REA investigation. Validate the governed evidence matrix, reference architecture, security model, execution semantics and design principles against it. Preserve its evidence labels and do not upgrade INFERRED or UNKNOWN claims without new evidence.
 
-Produce `docs/HANDOFF_PHASE_0.md` covering summary, tests/evidence checks, decisions, unresolved unknowns and next phase. No architecture expansion beyond evidence is allowed.
+Resolve contradictions by documenting them, never by silently rewriting evidence. If a derived governance document conflicts with the canonical REA investigation, the canonical evidence wins and the discrepancy must be surfaced for human review.
+
+Produce `docs/HANDOFF_PHASE_0.md` covering summary, evidence checks, decisions, contradictions, unresolved unknowns and next phase. No product implementation and no architecture expansion beyond supported evidence are allowed.
 
 Acceptance intent: the repository must clearly distinguish OBSERVED, SOURCE-VERIFIED, INFERRED and UNKNOWN claims and preserve WY-SEC-001 through WY-SEC-010.
