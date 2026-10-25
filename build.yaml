@@ -35,10 +35,8 @@
       "model_family": "codex",
       "prompt_lineage": "wyrit-v0",
       "network": true,
-      "auth_mode": "environment",
-      "credential_env": [
-        "OPENAI_API_KEY"
-      ],
+      "auth_mode": "host_cli",
+      "credential_env": [],
       "command": [
         "codex",
         "exec",
@@ -51,25 +49,22 @@
       "remediation_prompt": "prompts/remediation/codex-remediation.md"
     },
     "reviewer": {
-      "vendor": "openai",
-      "model_family": "codex",
+      "vendor": "anthropic",
+      "model_family": "claude",
       "prompt_lineage": "wyrit-v0-review",
       "protocol_version": "buildctl-review-v2",
       "network": false,
-      "auth_mode": "environment",
-      "credential_env": [
-        "OPENAI_API_KEY"
-      ],
+      "auth_mode": "host_cli",
+      "credential_env": [],
       "command": [
-        "codex",
-        "exec",
-        "--ignore-user-config",
-        "--dangerously-bypass-approvals-and-sandbox",
-        "--output-last-message",
-        "{output}",
-        "{prompt}"
+        "claude",
+        "-p",
+        "{prompt}",
+        "--no-session-persistence",
+        "--tools",
+        "Read,Grep,Glob"
       ],
-      "review_prompt": "prompts/reviews/codex-adversarial-review.md",
+      "review_prompt": "prompts/reviews/claude-adversarial-review.md",
       "context_documents": [
         "docs/research/EVIDENCE_MATRIX.md",
         "docs/REFERENCE_ARCHITECTURE.md",
