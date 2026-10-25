@@ -154,18 +154,18 @@
       "acceptance": {
         "merge_policy": "human",
         "required_files": [
-          "docs/research/REA_FULL.md",
+          "docs/research/cloudflare-code-mode-rea.md",
           "docs/HANDOFF_PHASE_0.md"
         ],
         "allowed_paths": [
-          "docs/research/REA_FULL.md",
+          "docs/research/cloudflare-code-mode-rea.md",
           "docs/HANDOFF_PHASE_0.md"
         ],
         "commands": [
           [
             "python3",
             "-c",
-            "from pathlib import Path; p=Path('docs/research/REA_FULL.md'); assert p.is_file() and len(p.read_text())>1000, 'Import complete REA investigation before implementation'; print('rea_evidence=ok')"
+            "from pathlib import Path; p=Path('docs/research/cloudflare-code-mode-rea.md'); t=p.read_text(); assert p.is_file() and len(t)>10000, 'Canonical REA investigation missing or unexpectedly thin'; assert 'OBSERVED' in t and 'SOURCE-VERIFIED' in t, 'REA evidence labels missing'; print('rea_evidence=ok')"
           ]
         ]
       }
