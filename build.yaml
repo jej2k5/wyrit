@@ -1,0 +1,220 @@
+{
+  "version": 1,
+  "limits": {
+    "max_phase_attempts": 8,
+    "max_review_format_attempts": 4,
+    "max_semantic_review_attempts": 12,
+    "max_debate_rounds": 4,
+    "max_phase_minutes": 180,
+    "max_daily_cost_usd": 100,
+    "max_consecutive_failures": 3
+  },
+  "operation_cost_usd": {
+    "implementation": 2,
+    "review": 2,
+    "remediation": 2,
+    "debate": 5
+  },
+  "governance_documents": [
+    "docs/research/cloudflare-code-mode-rea.md",
+    "docs/research/EVIDENCE_MATRIX.md",
+    "docs/REFERENCE_ARCHITECTURE.md",
+    "docs/SECURITY_MODEL.md",
+    "docs/EXECUTION_SEMANTICS.md",
+    "docs/DESIGN_PRINCIPLES.md"
+  ],
+  "git": {
+    "remote": "origin",
+    "push": false,
+    "create_pr": false,
+    "merge": false
+  },
+  "roles": {
+    "implementer": {
+      "vendor": "openai",
+      "model_family": "codex",
+      "prompt_lineage": "wyrit-v0",
+      "network": true,
+      "auth_mode": "environment",
+      "credential_env": [
+        "OPENAI_API_KEY"
+      ],
+      "command": [
+        "codex",
+        "exec",
+        "--ignore-user-config",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--output-last-message",
+        "{output}",
+        "{prompt}"
+      ],
+      "remediation_prompt": "prompts/remediation/codex-remediation.md"
+    },
+    "reviewer": {
+      "vendor": "openai",
+      "model_family": "codex",
+      "prompt_lineage": "wyrit-v0-review",
+      "protocol_version": "buildctl-review-v2",
+      "network": false,
+      "auth_mode": "environment",
+      "credential_env": [
+        "OPENAI_API_KEY"
+      ],
+      "command": [
+        "codex",
+        "exec",
+        "--ignore-user-config",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--output-last-message",
+        "{output}",
+        "{prompt}"
+      ],
+      "review_prompt": "prompts/reviews/codex-adversarial-review.md",
+      "context_documents": [
+        "docs/research/EVIDENCE_MATRIX.md",
+        "docs/REFERENCE_ARCHITECTURE.md",
+        "docs/SECURITY_MODEL.md",
+        "docs/EXECUTION_SEMANTICS.md",
+        "docs/DESIGN_PRINCIPLES.md"
+      ]
+    },
+    "arbiter": {
+      "vendor": "jej2k5",
+      "model_family": "agent-debate",
+      "prompt_lineage": "wyrit-v0",
+      "network": false,
+      "auth_mode": "none",
+      "credential_env": [],
+      "mode": "interactive",
+      "command": [
+        "agent-debate",
+        "--phase",
+        "{phase}",
+        "--prompt",
+        "{prompt}",
+        "--review",
+        "{review}",
+        "--max-rounds",
+        "{rounds}",
+        "--output",
+        "{output}"
+      ]
+    }
+  },
+  "milestones": {
+    "mvp": 7
+  },
+  "checkpoints": {
+    "before_phases": [
+      0,
+      6,
+      7
+    ],
+    "mvp_completion": 7
+  },
+  "phase_defaults": {
+    "required_files": [
+      "docs/HANDOFF_PHASE_{phase}.md"
+    ],
+    "commands": [
+      [
+        "{python}",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests"
+      ]
+    ],
+    "invariants": [
+      "no_credentials_in_generated_code",
+      "no_ambient_runtime_network",
+      "no_ambient_runtime_filesystem",
+      "no_arbitrary_process_spawn",
+      "all_external_calls_through_trusted_host",
+      "run_scoped_authorization",
+      "sandbox_fail_closed",
+      "execution_action_lifecycle_separation",
+      "unknown_external_outcomes_preserved",
+      "no_unsafe_nonidempotent_replay"
+    ],
+    "claude_review_required": true,
+    "debate_on_architecture_disagreement": true,
+    "max_remediation_attempts": 6,
+    "merge_policy": "auto",
+    "allowed_paths": [
+      "src/",
+      "tests/",
+      "pyproject.toml",
+      "package.json",
+      "package-lock.json",
+      "docs/HANDOFF_PHASE_{phase}.md"
+    ]
+  },
+  "phases": [
+    {
+      "number": 0,
+      "name": "Evidence and security contract",
+      "prompt": "prompts/phases/phase-00-evidence-security-contract.md",
+      "acceptance": {
+        "merge_policy": "human",
+        "required_files": [
+          "docs/research/REA_FULL.md",
+          "docs/HANDOFF_PHASE_0.md"
+        ],
+        "allowed_paths": [
+          "docs/research/REA_FULL.md",
+          "docs/HANDOFF_PHASE_0.md"
+        ],
+        "commands": [
+          [
+            "python3",
+            "-c",
+            "from pathlib import Path; p=Path('docs/research/REA_FULL.md'); assert p.is_file() and len(p.read_text())>1000, 'Import complete REA investigation before implementation'; print('rea_evidence=ok')"
+          ]
+        ]
+      }
+    },
+    {
+      "number": 1,
+      "name": "Capability model and discovery",
+      "prompt": "prompts/phases/phase-01-capability-model.md"
+    },
+    {
+      "number": 2,
+      "name": "Disposable JavaScript runtime",
+      "prompt": "prompts/phases/phase-02-disposable-js-runtime.md"
+    },
+    {
+      "number": 3,
+      "name": "Trusted invocation protocol",
+      "prompt": "prompts/phases/phase-03-invocation-protocol.md"
+    },
+    {
+      "number": 4,
+      "name": "MCP adapter and authorization",
+      "prompt": "prompts/phases/phase-04-mcp-adapter.md"
+    },
+    {
+      "number": 5,
+      "name": "Run and external-action lifecycle",
+      "prompt": "prompts/phases/phase-05-lifecycle.md"
+    },
+    {
+      "number": 6,
+      "name": "Native sandbox enforcement",
+      "prompt": "prompts/phases/phase-06-native-sandbox.md",
+      "acceptance": {
+        "merge_policy": "human"
+      }
+    },
+    {
+      "number": 7,
+      "name": "End-to-end Wyrit MVP",
+      "prompt": "prompts/phases/phase-07-mvp.md",
+      "acceptance": {
+        "merge_policy": "human"
+      }
+    }
+  ]
+}

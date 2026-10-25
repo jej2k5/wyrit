@@ -1,0 +1,1 @@
+Remediate only findings accepted by the buildctl review protocol. Preserve governed documents and security invariants. Make the smallest change that closes the finding, add or strengthen a regression test, and report exactly what changed and which acceptance command demonstrates closure. Do not weaken a gate to make it pass.
