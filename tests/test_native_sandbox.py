@@ -11,11 +11,23 @@ from unittest.mock import patch
 
 from native_support import require_native, run_native
 from src.wyrit.capabilities import RunAuthorization
-from src.wyrit.native_sandbox import LINUX_DATA_BYTES, _file_chain
+from src.wyrit.native_sandbox import LINUX_DATA_BYTES, _file_chain, _mac_profile
 from src.wyrit.runtime import run_javascript
 
 
 class NativeSandboxTests(unittest.TestCase):
+    def test_macos_profile_limits_sysctl_reads_to_kernel_names_and_hardware_prefixes(self):
+        with patch("src.wyrit.native_sandbox._mac_runtime_files", return_value={"/node"}), patch(
+            "src.wyrit.native_sandbox._file_chain", return_value=("/node",),
+        ):
+            profile = _mac_profile("/node", deadline=0)
+
+        self.assertIn("(deny default)", profile.splitlines())
+        self.assertEqual(
+            [line for line in profile.splitlines() if "(allow sysctl-read" in line],
+            ['(allow sysctl-read (sysctl-name "kern.osrelease" "kern.osversion" "kern.ostype" "kern.version" "kern.hostname") (sysctl-name-prefix "hw.") (sysctl-name-prefix "machdep.cpu."))'],
+        )
+
     def test_missing_runtime_fails_closed(self):
         with patch("src.wyrit.runtime.shutil.which", return_value=None):
             result = run_javascript("return 1;", run_id="native",

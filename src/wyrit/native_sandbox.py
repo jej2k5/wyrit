@@ -122,9 +122,7 @@ def _mac_profile(node, deadline):
         f"(allow file-read-metadata {_literals(ancestors)})",
         '(allow file-read-data (literal "/") (literal "/dev/null")'
         ' (literal "/dev/urandom") (literal "/dev/random"))',
-        '(allow sysctl-read (sysctl-name "hw.ncpu" "hw.logicalcpu" "hw.logicalcpu_max"'
-        ' "hw.physicalcpu" "hw.memsize" "hw.pagesize" "hw.cachelinesize"'
-        ' "kern.osrelease" "kern.osversion" "kern.ostype" "kern.version" "kern.hostname"))',
+        '(allow sysctl-read (sysctl-name "kern.osrelease" "kern.osversion" "kern.ostype" "kern.version" "kern.hostname") (sysctl-name-prefix "hw.") (sysctl-name-prefix "machdep.cpu."))',
     ))
 
 
