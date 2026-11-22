@@ -54,7 +54,7 @@
       "model_family": "claude",
       "prompt_lineage": "wyrit-v0-review",
       "protocol_version": "buildctl-review-v2",
-      "network": false,
+      "network": true,
       "auth_mode": "host_cli",
       "credential_env": [],
       "command": [
