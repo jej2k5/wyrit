@@ -15,6 +15,7 @@ from .capabilities import RunAuthorization
 from .invocation import (
     ActionRecord, CallError, ECHO_CAPABILITY, MESSAGE_BYTES, InvocationProtocol, encode,
 )
+from .native_sandbox import SandboxUnavailable, native_command
 
 
 RESULT_BYTES = 16 * 1024
@@ -118,13 +119,23 @@ def run_javascript(source, *, run_id, authorization, timeout=2.0, dispatch=None,
         return RunResult("FAILED", reason="Node.js unavailable")
     try:
         driver = Path(__file__).with_name("runtime_child.cjs").read_text(encoding="utf-8")
-        child = subprocess.Popen(
-            [os.path.abspath(node), "--permission", "--no-allow-net", "--experimental-vm-modules",
-             "--disallow-code-generation-from-strings", "--unhandled-rejections=strict",
-             "-e", driver],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            env={}, cwd="/", bufsize=0,
-        )
+        with native_command(node, [
+            "--permission", "--no-allow-net", "--experimental-vm-modules",
+            "--disallow-code-generation-from-strings", "--unhandled-rejections=strict",
+            "-e", driver,
+        ], deadline=deadline) as (command, descriptors):
+            remaining()
+            child = subprocess.Popen(
+                command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env={}, cwd="/", bufsize=0, pass_fds=descriptors,
+            )
+    except SandboxUnavailable as error:
+        return RunResult("FAILED", reason=str(error))
+    except _RunCancelled:
+        return RunResult("CANCELLED", reason="Run cancellation requested",
+                         cancellation_requested=True, cancellation_confirmed=True)
+    except TimeoutError:
+        return RunResult("TIMED_OUT", reason="Run deadline exceeded")
     except OSError:
         return RunResult("FAILED", reason="Could not launch JavaScript runtime")
 

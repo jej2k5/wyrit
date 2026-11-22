@@ -1,6 +1,7 @@
 import json
 import unittest
 from unittest.mock import patch
+from native_support import require_native
 
 from src.wyrit.capabilities import RunAuthorization
 from src.wyrit.invocation import InvocationProtocol, VERSION
@@ -9,6 +10,7 @@ from src.wyrit.runtime import RunResult, run_javascript
 
 class InvocationTests(unittest.TestCase):
     def setUp(self):
+        require_native(self)
         self.authorization = RunAuthorization("current-run", {"fake.echo", "fake.unknown"})
         self.call = {
             "version": VERSION, "type": "call", "run_id": "current-run",

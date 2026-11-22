@@ -1,6 +1,7 @@
 from threading import BoundedSemaphore, Event
 import unittest
 from unittest.mock import patch
+from native_support import require_native
 
 from src.wyrit.capabilities import RunAuthorization
 from src.wyrit.invocation import ActionRecord, CallError
@@ -9,6 +10,9 @@ from src.wyrit.runtime import run_javascript
 
 class LifecycleTests(unittest.TestCase):
     capability = "fake.write"
+
+    def setUp(self):
+        require_native(self)
 
     def run_js(self, source, dispatch, **options):
         return run_javascript(

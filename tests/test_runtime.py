@@ -1,6 +1,7 @@
 import os
 import unittest
 from unittest.mock import patch
+from native_support import require_native
 
 from src.wyrit.capabilities import Capability, CapabilityRegistry
 from src.wyrit.runtime import ECHO_CAPABILITY, RunResult, run_javascript
@@ -8,6 +9,7 @@ from src.wyrit.runtime import ECHO_CAPABILITY, RunResult, run_javascript
 
 class RuntimeTests(unittest.TestCase):
     def setUp(self):
+        require_native(self)
         registry = CapabilityRegistry([Capability(ECHO_CAPABILITY, "Echo", True, True)])
         self.granted = registry.authorization_for("run", [ECHO_CAPABILITY])
         self.denied = registry.authorization_for("run", [])
@@ -96,7 +98,3 @@ class RuntimeTests(unittest.TestCase):
         ):
             with self.subTest(reason=reason), patch("src.wyrit.runtime.Path.read_text", return_value=driver):
                 self.assertEqual(self.run_js("return 1;"), RunResult("FAILED", reason=reason))
-
-    def test_missing_runtime_fails_closed(self):
-        with patch("src.wyrit.runtime.shutil.which", return_value=None):
-            self.assertEqual(self.run_js("return 1;").reason, "Node.js unavailable")

@@ -3,6 +3,7 @@ import sys
 import unittest
 from contextlib import AsyncExitStack, ExitStack, asynccontextmanager
 from unittest.mock import patch
+from native_support import require_native
 
 from anyio.from_thread import start_blocking_portal
 from mcp import ClientSession, StdioServerParameters
@@ -121,6 +122,7 @@ async def session_for_fixture():
 
 class MCPAdapterTests(unittest.TestCase):
     def setUp(self):
+        require_native(self)
         stack = self.enterContext(ExitStack())
         stack.enter_context(patch.dict(os.environ, {"WYRIT_MCP_TEST_CREDENTIAL": "host-test-canary"}))
         portal = stack.enter_context(start_blocking_portal())
