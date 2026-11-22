@@ -1,6 +1,6 @@
-"""Disposable JavaScript execution with a run-scoped fake echo capability."""
+"""Disposable JavaScript execution with trusted host capability dispatch."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import math
 import os
@@ -25,14 +25,15 @@ class RunResult:
     status: str
     value: object = None
     reason: str | None = None
+    unknown_calls: tuple[int, ...] = ()
 
 
 class _RunFailure(Exception):
     pass
 
 
-def run_javascript(source, *, run_id, authorization, timeout=2.0):
-    """Run an async function body once. The only fake endpoint echoes JSON."""
+def run_javascript(source, *, run_id, authorization, timeout=2.0, dispatch=None):
+    """Run an async function body once, authorizing every host dispatch."""
     if not isinstance(authorization, RunAuthorization) or authorization.run_id != run_id:
         return RunResult("FAILED", reason="Invalid run authorization")
     if not isinstance(source, str):
@@ -42,11 +43,11 @@ def run_javascript(source, *, run_id, authorization, timeout=2.0):
 
     if len(source) > MESSAGE_BYTES:
         return RunResult("FAILED", reason="Source message too large")
-    protocol = InvocationProtocol(run_id, authorization)
+    deadline = time.monotonic() + timeout
+    protocol = InvocationProtocol(run_id, authorization, dispatch=dispatch, deadline=deadline)
     initial = encode(protocol.envelope("start", source=source, messageBytes=MESSAGE_BYTES))
     if len(initial) > MESSAGE_BYTES:
         return RunResult("FAILED", reason="Source message too large")
-    deadline = time.monotonic() + timeout
 
     node = shutil.which("node")
     if node is None:
@@ -65,16 +66,17 @@ def run_javascript(source, *, run_id, authorization, timeout=2.0):
 
     with child:
         try:
-            return _exchange(child, initial, protocol, deadline)
+            result = _exchange(child, initial, protocol, deadline)
         except TimeoutError:
-            return RunResult("TIMED_OUT", reason="Run deadline exceeded")
+            result = RunResult("TIMED_OUT", reason="Run deadline exceeded")
         except _RunFailure as error:
-            return RunResult("FAILED", reason=str(error))
+            result = RunResult("FAILED", reason=str(error))
         except (OSError, ValueError, RecursionError):
-            return RunResult("FAILED", reason="Invalid runtime protocol")
+            result = RunResult("FAILED", reason="Invalid runtime protocol")
         finally:
             child.kill()
             child.wait()
+    return replace(result, unknown_calls=tuple(protocol.unknown_calls))
 
 
 def _remaining(deadline):

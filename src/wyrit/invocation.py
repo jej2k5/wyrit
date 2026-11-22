@@ -38,11 +38,22 @@ def _check_value(value, depth=0):
         raise ValueError("Unsupported JSON number")
 
 
+class CallError(Exception):
+    """A host adapter failure with a public, fixed protocol code."""
+
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
 class InvocationProtocol:
-    def __init__(self, run_id, authorization):
+    def __init__(self, run_id, authorization, *, dispatch=None, deadline=None):
         self.run_id = run_id
         self.authorization = authorization
+        self.dispatch = dispatch
+        self.deadline = deadline
         self.next_call_id = 1
+        self.unknown_calls = []
 
     def envelope(self, kind, **fields):
         return {"version": VERSION, "run_id": self.run_id, "type": kind, **fields}
@@ -74,6 +85,18 @@ class InvocationProtocol:
                 or type(capability) is not str or not _ID.fullmatch(capability)):
             raise ValueError("Invalid capability or call ID")
         self.next_call_id += 1
-        if capability != ECHO_CAPABILITY or not self.authorization.allows(self.run_id, capability):
+        if (message["run_id"] != self.run_id
+                or not self.authorization.allows(self.run_id, capability)):
             return self.envelope("call_error", call_id=call_id, code="DENIED")
-        return self.envelope("call_result", call_id=call_id, result=message["args"])
+        try:
+            if capability == ECHO_CAPABILITY:
+                result = message["args"]
+            elif self.dispatch is None:
+                raise CallError("DENIED")
+            else:
+                result = self.dispatch(capability, message["args"], deadline=self.deadline)
+        except CallError as error:
+            if error.code == "OUTCOME_UNKNOWN":
+                self.unknown_calls.append(call_id)
+            return self.envelope("call_error", call_id=call_id, code=error.code)
+        return self.envelope("call_result", call_id=call_id, result=result)

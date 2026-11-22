@@ -39,6 +39,15 @@ async function main() {
         const toString = String;
         const PromiseType = Promise;
         const ErrorType = Error;
+        const callErrors = {
+            __proto__: null,
+            DENIED: "Capability call denied",
+            INVALID_ARGUMENTS: "Invalid capability arguments",
+            TOOL_ERROR: "Capability tool reported an error",
+            OUTCOME_UNKNOWN: "Capability outcome unknown",
+            INVALID_RESULT: "Invalid capability response",
+            RESULT_TOO_LARGE: "Capability response too large",
+        };
         let callId = 0;
         let pending;
         let final;
@@ -149,9 +158,8 @@ async function main() {
                 if (reply.type === "call_result" && owns(reply, "result")) {
                     current.resolve(reply.result);
                 } else if (reply.type === "call_error" && owns(reply, "code") &&
-                    (reply.code === "DENIED" || reply.code === "RESULT_TOO_LARGE")) {
-                    current.reject(new ErrorType(reply.code === "DENIED" ?
-                        "Capability call denied" : "Capability response too large"));
+                    typeof reply.code === "string" && owns(callErrors, reply.code)) {
+                    current.reject(new ErrorType(callErrors[reply.code]));
                 } else {
                     throw new ErrorType("Invalid capability response");
                 }
