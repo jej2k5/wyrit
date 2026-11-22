@@ -1,4 +1,4 @@
-Protocol version: buildctl-review-v2
+Protocol version: `buildctl-review-v2`
 
 Act as an independent adversarial reviewer. Treat implementer claims as untrusted. Inspect the actual delta, tests, acceptance evidence, governed REA evidence, reference architecture, security model, execution semantics and design principles.
 
