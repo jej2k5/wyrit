@@ -29,7 +29,7 @@ The review relies on the canonical report for A1 and M1's partial static coverag
 
 ## Security decisions
 
-These requirements govern Wyrit. Implementation phases must verify their enforcement.
+These requirements govern Wyrit. Implementation phases must verify their enforcement. `docs/SECURITY_MODEL.md` is authoritative; where a row here paraphrases it, the governed text wins.
 
 | ID | Contract |
 |---|---|
@@ -40,8 +40,8 @@ These requirements govern Wyrit. Implementation phases must verify their enforce
 | WY-SEC-005 | All external capability invocations pass through the trusted host. |
 | WY-SEC-006 | Every invocation is authorized against its run-bound capability set. |
 | WY-SEC-007 | The sandbox fails closed when a promised guarantee cannot be enforced. |
-| WY-SEC-008 | Execution termination and dispatched action completion or cancellation remain separate facts. |
-| WY-SEC-009 | Dispatched actions with unestablished completion retain UNKNOWN outcomes. |
+| WY-SEC-008 | Terminating JavaScript is never represented as cancellation of already-dispatched external actions. |
+| WY-SEC-009 | Unknown external action outcomes remain UNKNOWN. |
 | WY-SEC-010 | Automatic replay of non-idempotent actions requires an explicit safety mechanism. |
 
 ## Unresolved unknowns
