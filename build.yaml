@@ -46,8 +46,7 @@
         "--output-last-message",
         "{output}",
         "{prompt}"
-      ],
-      "remediation_prompt": "prompts/remediation/codex-remediation.md"
+      ]
     },
     "reviewer": {
       "vendor": "anthropic",
@@ -68,8 +67,8 @@
         "stream-json",
         "--verbose"
       ],
-      "review_prompt": "prompts/reviews/claude-adversarial-review.md",
       "context_documents": [
+        "prompts/reviews/claude-adversarial-review.md",
         "docs/research/EVIDENCE_MATRIX.md",
         "docs/REFERENCE_ARCHITECTURE.md",
         "docs/SECURITY_MODEL.md",
