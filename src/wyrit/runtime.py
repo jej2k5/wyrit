@@ -1,5 +1,6 @@
 """Disposable JavaScript execution with trusted host capability dispatch."""
 
+from concurrent.futures import Future, wait
 from dataclasses import dataclass, replace
 from pathlib import Path
 import math
@@ -7,17 +8,20 @@ import os
 import selectors
 import shutil
 import subprocess
+from threading import BoundedSemaphore, Thread
 import time
 
 from .capabilities import RunAuthorization
-
-
-from .invocation import ECHO_CAPABILITY, MESSAGE_BYTES, InvocationProtocol, encode
+from .invocation import (
+    ActionRecord, CallError, ECHO_CAPABILITY, MESSAGE_BYTES, InvocationProtocol, encode,
+)
 
 
 RESULT_BYTES = 16 * 1024
 STDOUT_BYTES = 256 * 1024
 STDERR_BYTES = 8 * 1024
+CANCELLATION_POLL_SECONDS = 0.02
+_DISPATCH_SLOTS = BoundedSemaphore(8)
 
 
 @dataclass(frozen=True)
@@ -26,14 +30,22 @@ class RunResult:
     value: object = None
     reason: str | None = None
     unknown_calls: tuple[int, ...] = ()
+    actions: tuple[ActionRecord, ...] = ()
+    cancellation_requested: bool = False
+    cancellation_confirmed: bool = False
 
 
 class _RunFailure(Exception):
     pass
 
 
-def run_javascript(source, *, run_id, authorization, timeout=2.0, dispatch=None):
-    """Run an async function body once, authorizing every host dispatch."""
+class _RunCancelled(Exception):
+    pass
+
+
+def run_javascript(source, *, run_id, authorization, timeout=2.0, dispatch=None,
+                   cancel_event=None):
+    """Run an async function body once, with optional cancellation via threading.Event."""
     if not isinstance(authorization, RunAuthorization) or authorization.run_id != run_id:
         return RunResult("FAILED", reason="Invalid run authorization")
     if not isinstance(source, str):
@@ -44,7 +56,59 @@ def run_javascript(source, *, run_id, authorization, timeout=2.0, dispatch=None)
     if len(source) > MESSAGE_BYTES:
         return RunResult("FAILED", reason="Source message too large")
     deadline = time.monotonic() + timeout
-    protocol = InvocationProtocol(run_id, authorization, dispatch=dispatch, deadline=deadline)
+
+    def remaining():
+        if cancel_event is not None and cancel_event.is_set():
+            raise _RunCancelled
+        return _remaining(deadline)
+
+    def wait_interval():
+        seconds = remaining()
+        return seconds if cancel_event is None else min(seconds, CANCELLATION_POLL_SECONDS)
+
+    def invoke(capability, args, *, deadline):
+        completion = Future()
+        slots = _DISPATCH_SLOTS
+
+        def dispatch_once():
+            try:
+                try:
+                    remaining()
+                except (TimeoutError, _RunCancelled):
+                    raise CallError("DISPATCH_UNAVAILABLE", dispatched=False) from None
+                result = dispatch(capability, args, deadline=deadline)
+            except CallError as error:
+                outcome = (None, error)
+            except BaseException:
+                outcome = (None, CallError("OUTCOME_UNKNOWN"))
+            else:
+                outcome = (result, None)
+            finally:
+                slots.release()
+            value, error = outcome
+            if error is None:
+                completion.set_result(value)
+            else:
+                completion.set_exception(error)
+
+        # The controller owns the deadline and ledger even if a host adapter stalls.
+        if not slots.acquire(blocking=False):
+            raise CallError("DISPATCH_UNAVAILABLE", dispatched=False)
+        try:
+            Thread(target=dispatch_once, daemon=True).start()
+        except RuntimeError as error:
+            slots.release()
+            raise CallError("DISPATCH_UNAVAILABLE", dispatched=False) from error
+        while not completion.done():
+            wait((completion,), timeout=wait_interval())
+        return completion.result()
+
+    if cancel_event is not None and cancel_event.is_set():
+        return RunResult("CANCELLED", reason="Run cancellation requested",
+                         cancellation_requested=True, cancellation_confirmed=True)
+    protocol = InvocationProtocol(
+        run_id, authorization, dispatch=invoke if dispatch is not None else None, deadline=deadline,
+    )
     initial = encode(protocol.envelope("start", source=source, messageBytes=MESSAGE_BYTES))
     if len(initial) > MESSAGE_BYTES:
         return RunResult("FAILED", reason="Source message too large")
@@ -66,7 +130,10 @@ def run_javascript(source, *, run_id, authorization, timeout=2.0, dispatch=None)
 
     with child:
         try:
-            result = _exchange(child, initial, protocol, deadline)
+            result = _exchange(child, initial, protocol, remaining, wait_interval)
+        except _RunCancelled:
+            result = RunResult("CANCELLED", reason="Run cancellation requested",
+                               cancellation_requested=True)
         except TimeoutError:
             result = RunResult("TIMED_OUT", reason="Run deadline exceeded")
         except _RunFailure as error:
@@ -76,7 +143,12 @@ def run_javascript(source, *, run_id, authorization, timeout=2.0, dispatch=None)
         finally:
             child.kill()
             child.wait()
-    return replace(result, unknown_calls=tuple(protocol.unknown_calls))
+    actions = protocol.finalize_actions()
+    return replace(
+        result, actions=actions,
+        unknown_calls=tuple(action.call_id for action in actions if action.status == "UNKNOWN"),
+        cancellation_confirmed=result.cancellation_requested,
+    )
 
 
 def _remaining(deadline):
@@ -86,7 +158,7 @@ def _remaining(deadline):
     return seconds
 
 
-def _exchange(child, initial, protocol, deadline):
+def _exchange(child, initial, protocol, remaining, wait_interval):
     outgoing = initial + b"\n"
     buffered = bytearray()
     totals = {"stdout": 0, "stderr": 0}
@@ -101,8 +173,8 @@ def _exchange(child, initial, protocol, deadline):
             selector.register(stream, event, name)
 
         while selector.get_map():
-            for key, _ in selector.select(_remaining(deadline)):
-                _remaining(deadline)
+            for key, _ in selector.select(wait_interval()):
+                remaining()
                 channel = key.data
                 try:
                     if channel == "stdin":
@@ -124,7 +196,7 @@ def _exchange(child, initial, protocol, deadline):
 
                 buffered.extend(chunk)
                 while (newline := buffered.find(b"\n")) != -1:
-                    _remaining(deadline)
+                    remaining()
                     if newline > MESSAGE_BYTES or terminal is not None or outgoing:
                         raise _RunFailure("Invalid runtime message")
                     raw = bytes(buffered[:newline])
@@ -140,6 +212,7 @@ def _exchange(child, initial, protocol, deadline):
                                 raise _RunFailure("Final result too large")
                             terminal = RunResult("SUCCESS", value=value)
                         else:
+                            remaining()
                             reply = protocol.respond(message)
                             payload = encode(reply)
                             if len(payload) > MESSAGE_BYTES:
@@ -153,11 +226,13 @@ def _exchange(child, initial, protocol, deadline):
                 if len(buffered) > MESSAGE_BYTES:
                     raise _RunFailure("Runtime message too large")
 
-    try:
-        exit_code = child.wait(timeout=_remaining(deadline))
-    except subprocess.TimeoutExpired as error:
-        raise TimeoutError from error
-    _remaining(deadline)
+    while True:
+        try:
+            exit_code = child.wait(timeout=wait_interval())
+            break
+        except subprocess.TimeoutExpired:
+            remaining()
+    remaining()
     if buffered or terminal is None or exit_code:
         raise _RunFailure("JavaScript runtime terminated without a valid outcome")
     return terminal

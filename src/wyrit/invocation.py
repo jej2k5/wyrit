@@ -1,5 +1,6 @@
 """Versioned JSON-line messages on a single run's private pipes."""
 
+from dataclasses import dataclass, replace
 import json
 import math
 
@@ -41,9 +42,19 @@ def _check_value(value, depth=0):
 class CallError(Exception):
     """A host adapter failure with a public, fixed protocol code."""
 
-    def __init__(self, code):
+    def __init__(self, code, *, dispatched=True, action_status=None):
         super().__init__(code)
         self.code = code
+        self.dispatched = dispatched
+        self.action_status = action_status
+
+
+@dataclass(frozen=True)
+class ActionRecord:
+    call_id: int
+    capability: str
+    status: str
+    code: str | None = None
 
 
 class InvocationProtocol:
@@ -53,7 +64,7 @@ class InvocationProtocol:
         self.dispatch = dispatch
         self.deadline = deadline
         self.next_call_id = 1
-        self.unknown_calls = []
+        self._actions = {}
 
     def envelope(self, kind, **fields):
         return {"version": VERSION, "run_id": self.run_id, "type": kind, **fields}
@@ -88,15 +99,30 @@ class InvocationProtocol:
         if (message["run_id"] != self.run_id
                 or not self.authorization.allows(self.run_id, capability)):
             return self.envelope("call_error", call_id=call_id, code="DENIED")
+        if capability == ECHO_CAPABILITY:
+            return self.envelope("call_result", call_id=call_id, result=message["args"])
+        if self.dispatch is None:
+            return self.envelope("call_error", call_id=call_id, code="DENIED")
+
+        action = ActionRecord(call_id, capability, "CREATED")
+        self._actions[call_id] = action
+        self._actions[call_id] = replace(action, status="DISPATCHED")
         try:
-            if capability == ECHO_CAPABILITY:
-                result = message["args"]
-            elif self.dispatch is None:
-                raise CallError("DENIED")
-            else:
-                result = self.dispatch(capability, message["args"], deadline=self.deadline)
+            result = self.dispatch(capability, message["args"], deadline=self.deadline)
         except CallError as error:
-            if error.code == "OUTCOME_UNKNOWN":
-                self.unknown_calls.append(call_id)
+            if error.dispatched:
+                status = error.action_status or (
+                    "UNKNOWN" if error.code == "OUTCOME_UNKNOWN" else "FAILED"
+                )
+                self._actions[call_id] = replace(action, status=status, code=error.code)
+            else:
+                del self._actions[call_id]
             return self.envelope("call_error", call_id=call_id, code=error.code)
+        self._actions[call_id] = replace(action, status="SUCCEEDED")
         return self.envelope("call_result", call_id=call_id, result=result)
+
+    def finalize_actions(self):
+        for call_id, action in self._actions.items():
+            if action.status == "DISPATCHED":
+                self._actions[call_id] = replace(action, status="UNKNOWN", code="OUTCOME_UNKNOWN")
+        return tuple(self._actions.values())

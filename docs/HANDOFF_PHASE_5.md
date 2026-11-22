@@ -1,0 +1,11 @@
+# Phase 5 handoff
+
+`run_javascript` returns a terminal run status of `SUCCESS`, `FAILED`, `TIMED_OUT`, or `CANCELLED`. The trusted controller owns the deadline and returns an immutable snapshot of external action records in `RunResult.actions`. Each record includes the run-local call ID, capability ID, status, and any public error code. `RunResult.unknown_calls` contains the IDs of actions with status `UNKNOWN`.
+
+The invocation protocol records `CREATED` and `DISPATCHED` before handing an authorized external call to its host dispatcher. Dispatch means host handoff. Downstream acceptance can remain uncertain. Built-in echo, authorization denials, and pre-dispatch rejections are excluded from the external action records. A valid MCP success records `SUCCEEDED`, including when size or content policy prevents returning the reply to the guest. An explicit MCP tool error records `FAILED`. Malformed or schema-invalid MCP replies, transport ambiguity, unexpected dispatcher exceptions, and unfinished dispatches at run termination record `UNKNOWN`. Terminal records survive later guest failure, timeout, or cancellation. A late adapter response leaves the returned snapshot intact.
+
+Pass a `threading.Event` as `cancel_event` to request cancellation. The controller checks it during I/O and adapter waits and closes admission when it observes the request. `cancellation_requested` reports observation of the request and `cancellation_confirmed` reports that the JavaScript process has been reaped or that cancellation prevented launch. Downstream work can continue after the run returns. The controller makes one dispatch attempt per admitted call and performs no automatic replay.
+
+Dispatch callbacks execute on host worker threads and receive the run deadline. They should honor it and use thread-safe host resources. Each host process admits up to eight outstanding dispatches, including callbacks still running after their runs have ended. At capacity, the guest receives `DISPATCH_UNAVAILABLE` and no external action record is retained. Action records live in the run result and in memory for the run's lifetime.
+
+Run `python3 -m unittest discover -s tests`. The lifecycle tests hold a dispatched write behind an event through timeout and cancellation, verify one attempt per call, and check that earlier confirmed outcomes survive guest termination.

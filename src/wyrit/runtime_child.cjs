@@ -42,6 +42,7 @@ async function main() {
         const callErrors = {
             __proto__: null,
             DENIED: "Capability call denied",
+            DISPATCH_UNAVAILABLE: "Capability dispatch unavailable",
             INVALID_ARGUMENTS: "Invalid capability arguments",
             TOOL_ERROR: "Capability tool reported an error",
             OUTCOME_UNKNOWN: "Capability outcome unknown",

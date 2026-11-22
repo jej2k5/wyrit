@@ -123,7 +123,7 @@ class MCPAdapter:
         try:
             _, name, inputs, outputs = self._tools[capability_id]
         except KeyError:
-            raise CallError("DENIED") from None
+            raise CallError("DENIED", dispatched=False) from None
         try:
             if not isinstance(args, dict):
                 raise ValueError
@@ -131,10 +131,10 @@ class MCPAdapter:
             _check_value(args, 1)
             inputs.validate(args)
         except (ValidationError, Unresolvable, TypeError, ValueError, RecursionError):
-            raise CallError("INVALID_ARGUMENTS") from None
+            raise CallError("INVALID_ARGUMENTS", dispatched=False) from None
 
         if time.monotonic() >= deadline:
-            raise TimeoutError
+            raise CallError("DISPATCH_UNAVAILABLE", dispatched=False)
         try:
             response = self._request("tools/call", {"name": name, "arguments": args}, deadline)
         except Exception:
@@ -146,13 +146,15 @@ class MCPAdapter:
             _check_json(result)
             _check_value(result, 1)
             if len(encode(result)) > MESSAGE_BYTES:
-                raise CallError("RESULT_TOO_LARGE")
+                raise CallError("RESULT_TOO_LARGE", action_status="SUCCEEDED")
             return result
         except (ValidationError, Unresolvable, TypeError, ValueError, RecursionError):
-            raise CallError("INVALID_RESULT") from None
+            raise CallError("INVALID_RESULT", action_status="UNKNOWN") from None
 
 
 def _adapt(response, outputs):
+    if not isinstance(response, dict):
+        raise ValueError("Invalid MCP result")
     is_error = response.get("isError", False)
     if type(is_error) is not bool or not isinstance(response.get("content"), list):
         raise ValueError("Invalid MCP result")
@@ -168,6 +170,7 @@ def _adapt(response, outputs):
 
     content = []
     remaining = BINARY_BYTES
+    unsupported_content = False
     for block in response["content"]:
         if not isinstance(block, dict):
             raise ValueError("Invalid MCP content block")
@@ -178,15 +181,34 @@ def _adapt(response, outputs):
             data, mime_type = block.get("data"), block.get("mimeType")
             if not isinstance(data, str) or not isinstance(mime_type, str):
                 raise ValueError("Invalid MCP binary block")
-            if len(data) > 4 * ((remaining + 2) // 3):
-                raise CallError("RESULT_TOO_LARGE")
-            try:
-                remaining -= len(base64.b64decode(data, validate=True))
-            except (ValueError, binascii.Error):
-                raise ValueError("Invalid MCP binary encoding") from None
-            if remaining < 0:
-                raise CallError("RESULT_TOO_LARGE")
+            remaining -= _decoded_size(data)
             content.append({"type": kind, "data": data, "mimeType": mime_type})
+        elif kind == "resource_link":
+            if not isinstance(block.get("uri"), str) or not isinstance(block.get("name"), str):
+                raise ValueError("Invalid MCP resource link")
+            unsupported_content = True
+        elif kind == "resource":
+            types.EmbeddedResource.model_validate(block)
+            unsupported_content = True
         else:
-            raise ValueError("Unsupported MCP content block")
+            raise ValueError("Invalid MCP content block")
+    if remaining < 0:
+        raise CallError("RESULT_TOO_LARGE", action_status="SUCCEEDED")
+    if unsupported_content:
+        raise CallError("INVALID_RESULT", action_status="SUCCEEDED")
     return {"content": content}
+
+
+def _decoded_size(data):
+    # Check even oversized blocks without allocating their entire decoded payload.
+    chunk_size = 4096  # A multiple of four base64 characters.
+    size = 0
+    for offset in range(0, len(data), chunk_size):
+        chunk = data[offset:offset + chunk_size]
+        if offset + chunk_size < len(data) and "=" in chunk:
+            raise ValueError("Invalid MCP binary encoding")
+        try:
+            size += len(base64.b64decode(chunk, validate=True))
+        except (ValueError, binascii.Error):
+            raise ValueError("Invalid MCP binary encoding") from None
+    return size

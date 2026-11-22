@@ -10,7 +10,7 @@ from mcp.client.stdio import stdio_client
 
 from src.wyrit.capabilities import CapabilityRegistry, RunAuthorization
 from src.wyrit.mcp_adapter import MCPAdapter
-from src.wyrit.runtime import RunResult, run_javascript
+from src.wyrit.runtime import ActionRecord, RunResult, run_javascript
 
 
 SERVER = r"""
@@ -84,12 +84,18 @@ for line in sys.stdin:
                 time.sleep(0.75)
                 continue
             elif case == "resource":
-                result["content"] = [{"type": "resource_link", "uri": "file:///etc/passwd"}]
+                result["content"] = [{"type": "resource_link", "uri": "file:///etc/passwd",
+                                      "name": "fixture"}]
             elif case == "text":
                 result["content"] = [{"type": "text", "text": "x" * 65536}]
+            elif case == "missing-content":
+                result = {}
+            elif case == "invalid-error-flag":
+                result["isError"] = "false"
             else:
                 data = {
                     "invalid": "!!!!", "large": base64.b64encode(b"x" * 8193).decode(),
+                    "oversized-invalid": "A" * 12000 + "!!!!",
                     "aggregate": base64.b64encode(b"x" * 4097).decode(), "small": "AQI=",
                 }[case]
                 block = {"type": "image", "data": data, "mimeType": "image/png", "_meta": secret}
@@ -149,7 +155,27 @@ class MCPAdapterTests(unittest.TestCase):
         """, "increment", "format"), RunResult("SUCCESS", {
             "result": {"content": [{"type": "text", "text": "value=42"}]},
             "globals": ["undefined"] * 4, "imports": [True] * 3,
-        }))
+        }, actions=(
+            ActionRecord(1, "demo.increment", "SUCCEEDED"),
+            ActionRecord(2, "demo.format", "SUCCEEDED"),
+        )))
+
+    def test_malformed_results_keep_downstream_outcome_unknown(self):
+        result = self.run_js("""
+            const errors = [];
+            for (const kind of ["missing-content", "invalid-error-flag", "oversized-invalid"]) {
+                try { await tools.call("demo.sample", {case: kind}); }
+                catch (error) { errors.push(error.message); }
+            }
+            return errors;
+        """, "sample")
+        self.assertEqual(result, RunResult(
+            "SUCCESS", ["Invalid capability response"] * 3, unknown_calls=(1, 2, 3),
+            actions=tuple(
+                ActionRecord(call_id, "demo.sample", "UNKNOWN", "INVALID_RESULT")
+                for call_id in (1, 2, 3)
+            ),
+        ))
 
     def test_denials_and_invalid_arguments_never_reach_mcp(self):
         self.assertEqual(self.run_js("""
@@ -168,7 +194,7 @@ class MCPAdapterTests(unittest.TestCase):
         })), RunResult("SUCCESS", [
             ["Capability call denied"] * 2 + ["Invalid capability arguments"] * 4,
             {"stats": 1},
-        ]))
+        ], actions=(ActionRecord(7, "demo.stats", "SUCCEEDED"),)))
         self.assertEqual(
             self.run_js('return await tools.call("demo.increment", {value: 1});',
                         authorization=RunAuthorization("stale", {"demo.increment"})),
@@ -192,7 +218,18 @@ class MCPAdapterTests(unittest.TestCase):
             + ["Capability tool reported an error", "Capability outcome unknown",
                "Invalid capability response"],
             {"sample": 8, "increment": 1, "stats": 1},
-        ], unknown_calls=(8,)))
+        ], unknown_calls=(2, 8, 9), actions=(
+            ActionRecord(1, "demo.sample", "SUCCEEDED"),
+            ActionRecord(2, "demo.sample", "UNKNOWN", "INVALID_RESULT"),
+            ActionRecord(3, "demo.sample", "SUCCEEDED", "INVALID_RESULT"),
+            ActionRecord(4, "demo.sample", "SUCCEEDED", "RESULT_TOO_LARGE"),
+            ActionRecord(5, "demo.sample", "SUCCEEDED", "RESULT_TOO_LARGE"),
+            ActionRecord(6, "demo.sample", "SUCCEEDED", "RESULT_TOO_LARGE"),
+            ActionRecord(7, "demo.sample", "FAILED", "TOOL_ERROR"),
+            ActionRecord(8, "demo.sample", "UNKNOWN", "OUTCOME_UNKNOWN"),
+            ActionRecord(9, "demo.increment", "UNKNOWN", "INVALID_RESULT"),
+            ActionRecord(10, "demo.stats", "SUCCEEDED"),
+        )))
 
     def test_deadline_preserves_unknown_call_and_stops_run(self):
         result = self.run_js(
@@ -201,7 +238,9 @@ class MCPAdapterTests(unittest.TestCase):
         )
         self.assertEqual(result, RunResult(
             "TIMED_OUT", reason="Run deadline exceeded", unknown_calls=(1,),
+            actions=(ActionRecord(1, "demo.sample", "UNKNOWN", "OUTCOME_UNKNOWN"),),
         ))
         self.assertEqual(self.run_js(
             'return await tools.call("demo.stats", {});', "stats",
-        ), RunResult("SUCCESS", {"sample": 1, "stats": 1}))
+        ), RunResult("SUCCESS", {"sample": 1, "stats": 1},
+                     actions=(ActionRecord(1, "demo.stats", "SUCCEEDED"),)))
