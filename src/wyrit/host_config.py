@@ -1,0 +1,155 @@
+"""Load and validate the trusted host configuration without opening transports."""
+
+from dataclasses import dataclass, field
+import os
+from pathlib import Path
+import re
+import tomllib
+from urllib.parse import urlsplit
+
+from .capabilities import _ID
+from .mcp_adapter import _TOOL_NAME
+
+
+_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+class ConfigError(ValueError):
+    """An operator configuration error safe to report at startup."""
+
+
+@dataclass(frozen=True)
+class ServerConfig:
+    name: str
+    namespace: str
+    transport: str
+    expose: tuple[str, ...] | None
+    command: str | None = None
+    args: tuple[str, ...] = ()
+    url: str | None = None
+    headers: tuple[tuple[str, str], ...] = field(default=(), repr=False)
+
+
+@dataclass(frozen=True)
+class HostConfig:
+    servers: tuple[ServerConfig, ...]
+    secrets: frozenset[str] = field(repr=False)
+
+
+def _keys(table, allowed, location):
+    if not isinstance(table, dict):
+        raise ConfigError(f"{location}: expected a table")
+    for key in table.keys() - allowed:
+        raise ConfigError(f"{location}.{key!r}: unknown field")
+
+
+def _valid_url(value):
+    if not isinstance(value, str) or re.search(r"[\s\\\x00-\x1f\x7f]|%(?![0-9a-fA-F]{2})", value):
+        return False
+    try:
+        url = urlsplit(value)
+        authority = r"(?:\[[^\]]+\]|[^:\[\]@/?#%]+)(?::[0-9]+)?"
+        return (
+            url.scheme in {"http", "https"} and bool(url.hostname)
+            and url.username is None and url.password is None and "#" not in value
+            and re.fullmatch(authority, url.netloc) is not None and url.port != 0
+        )
+    except ValueError:
+        return False
+
+
+def _headers(table, location, environ, secrets):
+    if not isinstance(table, dict):
+        raise ConfigError(f"{location}: expected a table")
+    headers = {}
+    names = set()
+    for name, reference in table.items():
+        if not _HEADER_NAME.fullmatch(name):
+            raise ConfigError(f"{location}: invalid HTTP header name")
+        header = f"{location}.{name}"
+        if name.lower() in names:
+            raise ConfigError(f"{header}: duplicate HTTP header")
+        names.add(name.lower())
+        if isinstance(reference, str):
+            raise ConfigError(f"{header}: use an environment reference for the header value")
+        _keys(reference, {"env", "prefix"}, header)
+        env = reference.get("env")
+        if not isinstance(env, str) or not _ENV_NAME.fullmatch(env):
+            raise ConfigError(f"{header}.env: expected an environment variable name")
+        secret = environ.get(env)
+        if not secret:
+            raise ConfigError(f"{header}.env: missing or empty environment variable {env}")
+        prefix = reference.get("prefix", "")
+        if not isinstance(prefix, str) or not re.fullmatch(r"[ -~]*", prefix):
+            raise ConfigError(f"{header}.prefix: expected printable ASCII text")
+        value = prefix + secret
+        if not re.fullmatch(r"[ -~]+", value) or value != value.strip():
+            raise ConfigError(f"{header}.env: invalid HTTP header value")
+        headers[name] = value
+        secrets.add(secret)
+    return tuple(headers.items())
+
+
+def _server(name, table, environ, secrets):
+    location = f"servers.{name!r}"
+    common = {"namespace", "transport", "expose"}
+    _keys(table, common | {"command", "args", "url", "headers"}, location)
+    namespace = table.get("namespace")
+    if not isinstance(namespace, str) or not _ID.fullmatch(namespace):
+        raise ConfigError(f"{location}.namespace: expected a capability prefix")
+    transport = table.get("transport")
+    expose = table.get("expose")
+    if expose == "all":
+        expose = None
+    elif (
+        isinstance(expose, list)
+        and all(isinstance(tool, str) and _TOOL_NAME.fullmatch(tool) for tool in expose)
+        and len(set(expose)) == len(expose)
+    ):
+        expose = tuple(expose)
+    else:
+        raise ConfigError(f"{location}.expose: expected 'all' or a list of unique tool names")
+
+    if transport == "stdio":
+        _keys(table, common | {"command", "args"}, location)
+        command = table.get("command")
+        if not isinstance(command, str) or not command.strip() or "\0" in command:
+            raise ConfigError(f"{location}.command: expected a nonempty executable name")
+        args = table.get("args", [])
+        if not isinstance(args, list) or any(not isinstance(arg, str) or "\0" in arg for arg in args):
+            raise ConfigError(f"{location}.args: expected a list of argument strings")
+        return ServerConfig(name, namespace, transport, expose, command=command, args=tuple(args))
+    if transport == "http":
+        _keys(table, common | {"url", "headers"}, location)
+        url = table.get("url")
+        if not _valid_url(url):
+            raise ConfigError(f"{location}.url: expected a valid HTTP(S) URL without userinfo or a fragment")
+        headers = _headers(table.get("headers", {}), f"{location}.headers", environ, secrets)
+        return ServerConfig(name, namespace, transport, expose, url=url, headers=headers)
+    raise ConfigError(f"{location}.transport: expected 'stdio' or 'http'")
+
+
+def load_config(path) -> HostConfig:
+    """Read TOML and resolve header references using the current environment."""
+    try:
+        data = tomllib.loads(Path(path).read_text(encoding="utf-8"))
+    except OSError:
+        raise ConfigError("config: could not read the TOML file") from None
+    except ValueError:
+        raise ConfigError("config: invalid TOML") from None
+    _keys(data, {"servers"}, "config")
+    tables = data.get("servers")
+    if not isinstance(tables, dict):
+        raise ConfigError("config.servers: expected a table")
+    environ = dict(os.environ)
+    secrets = set()
+    namespaces = set()
+    servers = []
+    for name, table in tables.items():
+        server = _server(name, table, environ, secrets)
+        if server.namespace in namespaces:
+            raise ConfigError(f"servers.{name!r}.namespace: duplicate namespace")
+        namespaces.add(server.namespace)
+        servers.append(server)
+    return HostConfig(tuple(servers), frozenset(secrets))

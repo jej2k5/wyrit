@@ -112,6 +112,10 @@ class CapabilityRegistry:
             raise ValueError(f"Duplicate capability ID: {capability.id}")
         self._capabilities[capability.id] = capability
 
+    @property
+    def ids(self):
+        return tuple(self._capabilities)
+
     def resolve(self, capability_id):
         """Return the host descriptor for an exact ID, or raise KeyError."""
         return self._capabilities[capability_id]

@@ -49,11 +49,15 @@ class MCPAdapter:
     Pass dispatch to run_javascript and use capabilities to build the host registry.
     """
 
-    def __init__(self, namespace, session, portal, *, discovery_timeout=5.0):
+    def __init__(self, namespace, session, portal, *, discovery_timeout=5.0,
+                 exposed_tools=None, secrets=()):
         _check_id(namespace)
         self._session = session
         self._portal = portal
+        self._secrets = tuple(secrets)
         self._tools = {}
+        selected = None if exposed_tools is None else frozenset(exposed_tools)
+        found = set()
         deadline = time.monotonic() + discovery_timeout
         cursor = None
         seen = set()
@@ -64,7 +68,11 @@ class MCPAdapter:
             if not isinstance(tools, list):
                 raise ValueError("Invalid MCP discovery page")
             for tool in tools:
+                name = tool["name"]
+                if selected is not None and name not in selected:
+                    continue
                 self._add_tool(namespace, tool)
+                found.add(name)
             cursor = page.get("nextCursor")
             if cursor is None:
                 break
@@ -73,12 +81,16 @@ class MCPAdapter:
             seen.add(cursor)
         else:
             raise ValueError("MCP discovery page limit exceeded")
+        if selected is not None and selected - found:
+            raise ValueError("Explicitly exposed MCP tool was not discovered")
 
     @property
     def capabilities(self):
         return tuple(tool[0] for tool in self._tools.values())
 
     def _add_tool(self, namespace, tool):
+        if self._contains_secret(tool):
+            raise ValueError("Sensitive data in MCP tool descriptor")
         name = tool["name"]
         capability_id = _capability_id(namespace, name)
         if capability_id in self._tools or capability_id == ECHO_CAPABILITY:
@@ -99,6 +111,18 @@ class MCPAdapter:
             },
         )
         self._tools[capability_id] = (capability, name, inputs, outputs)
+
+    def _contains_secret(self, value):
+        if not self._secrets:
+            return False
+        if isinstance(value, str):
+            return any(secret in value for secret in self._secrets)
+        if isinstance(value, dict):
+            return any(self._contains_secret(key) or self._contains_secret(child)
+                       for key, child in value.items())
+        if isinstance(value, list):
+            return any(self._contains_secret(child) for child in value)
+        return False
 
     def _request(self, method, params, deadline):
         # Use the SDK session for framing and correlation. Read the raw result
@@ -143,6 +167,8 @@ class MCPAdapter:
 
         try:
             result = _adapt(response, outputs)
+            if self._contains_secret(result):
+                raise ValueError("Sensitive data in MCP result")
             _check_json(result)
             _check_value(result, 1)
             if len(encode(result)) > MESSAGE_BYTES:

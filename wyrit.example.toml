@@ -1,0 +1,18 @@
+# Copy to wyrit.toml and uncomment the servers you trust.
+[servers]
+
+# [servers.local]
+# namespace = "local"
+# transport = "stdio"
+# command = "/absolute/path/to/mcp-server"
+# args = ["--stdio"]
+# expose = "all"
+
+# [servers.remote]
+# namespace = "remote"
+# transport = "http"
+# url = "https://mcp.example.com/mcp"
+# expose = ["list_items", "get_item"]
+#
+# [servers.remote.headers]
+# Authorization = { env = "MCP_API_TOKEN", prefix = "Bearer " }
