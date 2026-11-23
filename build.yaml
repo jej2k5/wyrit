@@ -100,13 +100,20 @@
     }
   },
   "milestones": {
-    "mvp": 7
+    "mvp": 7,
+    "real-work": 11,
+    "console": 13,
+    "measured": 14,
+    "complete": 16
   },
   "checkpoints": {
     "before_phases": [
       0,
       6,
-      7
+      7,
+      13,
+      15,
+      16
     ],
     "mvp_completion": 7
   },
@@ -211,6 +218,137 @@
       "name": "End-to-end Wyrit MVP",
       "prompt": "prompts/phases/phase-07-mvp.md",
       "acceptance": {
+        "merge_policy": "human"
+      }
+    },
+    {
+      "number": 8,
+      "name": "Host configuration",
+      "prompt": "prompts/phases/phase-08-host-configuration.md",
+      "acceptance": {
+        "allowed_paths": [
+          "src/",
+          "tests/",
+          "pyproject.toml",
+          "package.json",
+          "package-lock.json",
+          "docs/HANDOFF_PHASE_{phase}.md",
+          "wyrit.example.toml"
+        ]
+      }
+    },
+    {
+      "number": 9,
+      "name": "Live downstream sessions",
+      "prompt": "prompts/phases/phase-09-live-sessions.md",
+      "acceptance": {
+        "allowed_paths": [
+          "src/",
+          "tests/",
+          "pyproject.toml",
+          "package.json",
+          "package-lock.json",
+          "docs/HANDOFF_PHASE_{phase}.md",
+          "wyrit.example.toml"
+        ]
+      }
+    },
+    {
+      "number": 10,
+      "name": "Budgets for real work",
+      "prompt": "prompts/phases/phase-10-run-budgets.md",
+      "acceptance": {
+        "allowed_paths": [
+          "src/",
+          "tests/",
+          "pyproject.toml",
+          "package.json",
+          "package-lock.json",
+          "docs/HANDOFF_PHASE_{phase}.md",
+          "wyrit.example.toml"
+        ]
+      }
+    },
+    {
+      "number": 11,
+      "name": "Read and write policy",
+      "prompt": "prompts/phases/phase-11-read-write-policy.md",
+      "acceptance": {
+        "allowed_paths": [
+          "src/",
+          "tests/",
+          "pyproject.toml",
+          "package.json",
+          "package-lock.json",
+          "docs/HANDOFF_PHASE_{phase}.md",
+          "wyrit.example.toml"
+        ]
+      }
+    },
+    {
+      "number": 12,
+      "name": "Console, configuration",
+      "prompt": "prompts/phases/phase-12-console-configuration.md",
+      "acceptance": {
+        "merge_policy": "human"
+      }
+    },
+    {
+      "number": 13,
+      "name": "Console, monitoring and dashboard",
+      "prompt": "prompts/phases/phase-13-console-monitoring.md",
+      "acceptance": {
+        "merge_policy": "human"
+      }
+    },
+    {
+      "number": 14,
+      "name": "The measurement harness",
+      "prompt": "prompts/phases/phase-14-benchmark-harness.md",
+      "acceptance": {
+        "allowed_paths": [
+          "src/",
+          "tests/",
+          "pyproject.toml",
+          "package.json",
+          "package-lock.json",
+          "docs/HANDOFF_PHASE_{phase}.md",
+          "bench/"
+        ]
+      }
+    },
+    {
+      "number": 15,
+      "name": "Linux verification",
+      "prompt": "prompts/phases/phase-15-linux-verification.md",
+      "acceptance": {
+        "allowed_paths": [
+          "src/",
+          "tests/",
+          "pyproject.toml",
+          "package.json",
+          "package-lock.json",
+          "docs/HANDOFF_PHASE_{phase}.md",
+          "scripts/verify-linux.sh",
+          ".github/workflows/linux-sandbox.yml"
+        ]
+      }
+    },
+    {
+      "number": 16,
+      "name": "Works with MCPxy (optional pairing)",
+      "prompt": "prompts/phases/phase-16-works-with-mcpxy.md",
+      "acceptance": {
+        "allowed_paths": [
+          "src/",
+          "tests/",
+          "pyproject.toml",
+          "package.json",
+          "package-lock.json",
+          "docs/HANDOFF_PHASE_{phase}.md",
+          "docs/QUICKSTART.md",
+          "wyrit.example.toml"
+        ],
         "merge_policy": "human"
       }
     }
