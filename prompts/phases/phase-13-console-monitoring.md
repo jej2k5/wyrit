@@ -11,3 +11,6 @@ Extend the phase 12 console with what agents are doing, read only from the phase
 Every number links to, or can be traced to, the ledger lines behind it. Polling is cheap: read the ledger incrementally rather than rereading it whole.
 
 Tests (offline): from a synthetic ledger and health history, each view's numbers match a hand computation; percentiles are correct; capture stays off by default and purges on schedule; the feed survives a ledger file rotation. Produce the phase handoff.
+
+
+**Test secrets (operator note, 2026-11-23):** buildctl refuses any changed file containing a credential-shaped literal (`ghp_…`, `sk-…`, JWT-shaped strings, or `token = "<long literal>"`-style assignments), even a fake one, and fails the phase. Build fake secrets at runtime instead, for example `FAKE_TOKEN = "ghp_" + "x" * 36` or `"s" + "k-" + "test" * 6`, and assert on that variable; never write the assembled value into a source, fixture or snapshot file. Phase 8 attempt 1 failed this way in `tests/test_host_config.py`.
