@@ -152,6 +152,7 @@ class _Server:
         self.adapter = None
         self.generation = 0
         self.known = None
+        self.discovered = ()
 
 
 class ConfiguredHost:
@@ -180,6 +181,7 @@ class ConfiguredHost:
                 if slot.adapter is None:
                     slot.generation += 1
                 slot.known = {cap.id: cap for cap in adapter.capabilities}
+                slot.discovered = adapter.discovered
             slot.adapter = adapter
 
     async def _refresh(self, slot, connection, ready):
@@ -188,7 +190,8 @@ class ConfiguredHost:
         while not connection.closed:
             connection.changed = anyio.Event()
             adapter = await MCPAdapter.discover(
-                server.namespace, connection, self._portal, exposed_tools=server.expose,
+                server.namespace, connection, self._portal, exposed_tools=server.selected_tools,
+                excluded_tools=server.exclude,
                 secrets=lambda: connection_secrets | self._secrets, require_all=slot.known is None,
                 deny_writes=server.deny_writes, capability_policies=server.capabilities,
             )
@@ -249,6 +252,8 @@ class ConfiguredHost:
                 old = self._servers
                 new = {}
                 for server in config.servers:
+                    if not server.enabled:
+                        continue
                     slot = old.get(server.name)
                     new[server.name] = slot if slot and slot.config == server else _Server(server)
                 self._servers = new
@@ -263,6 +268,28 @@ class ConfiguredHost:
                     ready.append(started)
             for started in ready:
                 self._portal.call(started.wait)
+
+    def inventory(self):
+        with self._lock:
+            return {
+                name: (slot.health, self._safe_capabilities(slot.discovered))
+                for name, slot in self._servers.items()
+            }
+
+    def test_connection(self, server, secrets):
+        async def discover():
+            with anyio.fail_after(15):
+                async with _session(server) as connection:
+                    adapter = await MCPAdapter.discover(
+                        server.namespace, connection, self._portal, exposed_tools=server.selected_tools,
+                        excluded_tools=server.exclude,
+                        secrets=lambda: secrets | self._secrets | {value for _, value in server.headers},
+                        require_all=True, deny_writes=server.deny_writes,
+                        capability_policies=server.capabilities,
+                    )
+                    return adapter.discovered
+
+        return self._portal.call(discover)
 
     def _stop(self, slots):
         slots = tuple(slots)

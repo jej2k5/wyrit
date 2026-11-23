@@ -33,6 +33,14 @@ class ServerConfig:
     limits: dict = field(default_factory=dict, compare=False)
     deny_writes: bool = True
     capabilities: dict = field(default_factory=dict)
+    enabled: bool = True
+    exclude: tuple[str, ...] = ()
+
+    @property
+    def selected_tools(self):
+        if self.expose is None:
+            return None
+        return tuple(name for name in self.expose if name not in self.exclude)
 
 
 @dataclass(frozen=True)
@@ -91,7 +99,7 @@ def _require_https_for_headers(url, headers, location):
         raise ConfigError(f"{location}.headers: credential headers require HTTPS")
 
 
-def _headers(table, location, environ, secrets):
+def _headers(table, location, environ, secrets, *, enabled):
     if not isinstance(table, dict):
         raise ConfigError(f"{location}: expected a table")
     headers = {}
@@ -109,12 +117,14 @@ def _headers(table, location, environ, secrets):
         env = reference.get("env")
         if not isinstance(env, str) or not _ENV_NAME.fullmatch(env):
             raise ConfigError(f"{header}.env: expected an environment variable name")
-        secret = environ.get(env)
-        if not secret:
-            raise ConfigError(f"{header}.env: missing or empty environment variable {env}")
         prefix = reference.get("prefix", "")
         if not isinstance(prefix, str) or not re.fullmatch(r"[ -~]*", prefix):
             raise ConfigError(f"{header}.prefix: expected printable ASCII text")
+        if not enabled:
+            continue
+        secret = environ.get(env)
+        if not secret:
+            raise ConfigError(f"{header}.env: missing or empty environment variable {env}")
         value = prefix + secret
         if not re.fullmatch(r"[ -~]+", value) or value != value.strip():
             raise ConfigError(f"{header}.env: invalid HTTP header value")
@@ -148,7 +158,10 @@ def _write_policy(table, location, expose):
 
 def _server(name, table, environ, secrets):
     location = f"servers.{name!r}"
-    common = {"namespace", "transport", "expose", "limits", "deny_writes", "capabilities"}
+    common = {"namespace", "transport", "expose", "exclude", "limits", "deny_writes", "capabilities", "enabled"}
+    enabled = table.get("enabled", True)
+    if type(enabled) is not bool:
+        raise ConfigError(f"{location}.enabled: expected a boolean")
     _keys(table, common | {"command", "args", "url", "headers"}, location)
     limits = _limits(table.get("limits", {}), f"{location}.limits")
     namespace = table.get("namespace")
@@ -167,6 +180,11 @@ def _server(name, table, environ, secrets):
     else:
         raise ConfigError(f"{location}.expose: expected 'all' or a list of unique tool names")
 
+    exclude = table.get("exclude", [])
+    if (not isinstance(exclude, list)
+            or any(not isinstance(tool, str) or not _TOOL_NAME.fullmatch(tool) for tool in exclude)
+            or len(set(exclude)) != len(exclude)):
+        raise ConfigError(f"{location}.exclude: expected a list of unique tool names")
     policy = _write_policy(table, location, expose)
     if transport == "stdio":
         _keys(table, common | {"command", "args"}, location)
@@ -177,7 +195,7 @@ def _server(name, table, environ, secrets):
         if not isinstance(args, list) or any(not isinstance(arg, str) or "\0" in arg for arg in args):
             raise ConfigError(f"{location}.args: expected a list of argument strings")
         return ServerConfig(name, namespace, transport, expose, command=command,
-                            args=tuple(args), limits=limits, **policy)
+                            args=tuple(args), limits=limits, enabled=enabled, exclude=tuple(exclude), **policy)
     if transport == "http":
         _keys(table, common | {"url", "headers"}, location)
         url = table.get("url")
@@ -185,9 +203,9 @@ def _server(name, table, environ, secrets):
             raise ConfigError(f"{location}.url: expected a valid HTTP(S) URL without userinfo or a fragment")
         header_table = table.get("headers", {})
         _require_https_for_headers(url, header_table, location)
-        headers = _headers(header_table, f"{location}.headers", environ, secrets)
+        headers = _headers(header_table, f"{location}.headers", environ, secrets, enabled=enabled)
         return ServerConfig(name, namespace, transport, expose, url=url,
-                            headers=headers, limits=limits, **policy)
+                            headers=headers, limits=limits, enabled=enabled, exclude=tuple(exclude), **policy)
     raise ConfigError(f"{location}.transport: expected 'stdio' or 'http'")
 
 
@@ -235,6 +253,7 @@ def validate_config(config):
     for server in config.servers:
         if (not isinstance(server, ServerConfig) or not isinstance(server.name, str)
                 or not isinstance(server.namespace, str)
+                or not isinstance(server.exclude, tuple)
                 or not isinstance(server.args, tuple) or not isinstance(server.headers, tuple)
                 or (server.expose is not None and not isinstance(server.expose, tuple))):
             raise ConfigError("config.servers: invalid resolved server")
@@ -245,6 +264,8 @@ def validate_config(config):
         table = {
             "namespace": server.namespace, "transport": server.transport, "limits": server.limits,
             "deny_writes": server.deny_writes, "capabilities": server.capabilities,
+            "enabled": server.enabled,
+            "exclude": list(server.exclude),
             "expose": "all" if server.expose is None else list(server.expose),
         }
         if server.transport == "stdio" and server.url is None and not server.headers:

@@ -13,3 +13,4 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 wyrit = ["runtime_child.cjs"]
+"wyrit.console" = ["assets/*.html", "assets/*.css", "assets/*.js", "assets/*.woff2", "assets/*.txt"]

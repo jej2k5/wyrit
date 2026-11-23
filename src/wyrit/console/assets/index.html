@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="wyrit-token" content="@TOKEN@">
+<title>Wyrit Console</title>
+<style nonce="@NONCE@">@STYLE@</style>
+</head>
+<body data-page="@PAGE@">
+<aside>
+  <div class="brand">Wyrit</div>
+  <nav aria-label="Configuration">
+    <div class="section-label">Configuration</div>
+    <a href="/servers" data-target="servers">Servers</a>
+    <a href="/capabilities" data-target="capabilities">Capabilities</a>
+    <a href="/policy" data-target="policy">Policy and limits</a>
+  </nav>
+  <label class="theme">Theme
+    <select id="theme"><option value="system">System</option><option value="dark">Dark</option><option value="light">Light</option></select>
+  </label>
+</aside>
+<main>
+  <header><h1 id="title">Wyrit configuration</h1><button id="reload" type="button">Reload file</button></header>
+  <div id="health" class="health" aria-label="Server health"></div>
+  <p id="message" role="status" aria-live="polite" hidden></p>
+  <section id="servers" hidden>
+    <div class="toolbar"><h2>Downstream servers</h2><button class="primary" id="add" type="button">Add server</button></div>
+    <div id="server-list"></div>
+    <form id="editor" hidden>
+      <h2 id="editor-title">Server settings</h2>
+      <div class="fields">
+        <label>Name<input name="name" required></label>
+        <label>Namespace<input name="namespace" required></label>
+        <label>Transport<select name="transport"><option value="http">HTTP</option><option value="stdio">Stdio</option></select></label>
+        <label class="http">Endpoint URL<input name="url" type="url"></label>
+        <label class="stdio" hidden>Executable<input name="command"></label>
+        <label class="stdio" hidden>Arguments (JSON list)<textarea name="args" rows="2"></textarea></label>
+        <label class="http wide">Header references (JSON object)<textarea name="headers" rows="3" spellcheck="false" placeholder='{"Authorization":{"env":"MCP_API_TOKEN","prefix":"Bearer "}}'></textarea></label>
+        <label class="wide">Exposure ("all" or a JSON list of tool names)<input name="expose" required></label>
+        <label class="check"><input type="checkbox" name="enabled"> Enabled</label>
+      </div>
+      <div class="actions">
+        <button id="test" type="button">Test connection</button>
+        <button class="primary" type="submit">Save server</button>
+        <button id="cancel" type="button">Cancel</button>
+      </div>
+      <p id="editor-message" role="status" aria-live="polite" hidden></p>
+    </form>
+  </section>
+  <section id="capabilities" hidden>
+    <div class="toolbar"><label>Search capabilities<input id="query" type="search" autocomplete="off"></label></div>
+    <div id="catalog"></div>
+  </section>
+  <section id="policy" hidden>
+    <div class="toolbar"><h2>Write allowances</h2></div>
+    <div id="policies"></div>
+    <div class="toolbar"><h2>Execution limits</h2></div>
+    <div id="limits"></div>
+  </section>
+</main>
+<script nonce="@NONCE@">@SCRIPT@</script>
+</body>
+</html>

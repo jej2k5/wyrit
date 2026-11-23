@@ -80,15 +80,15 @@ class MCPAdapter:
 
     @classmethod
     async def discover(cls, namespace, session, portal, *, exposed_tools, secrets, require_all,
-                       deny_writes=True, capability_policies=None):
+                       deny_writes=True, capability_policies=None, excluded_tools=()):
         adapter = cls.__new__(cls)
         await adapter._discover(namespace, session, portal, 5.0, exposed_tools, secrets,
                                 deny_writes, capability_policies,
-                                require_all=require_all)
+                                require_all=require_all, excluded_tools=excluded_tools)
         return adapter
 
     async def _discover(self, namespace, session, portal, timeout, exposed_tools, secrets,
-                        deny_writes, capability_policies, *, require_all=True):
+                        deny_writes, capability_policies, *, require_all=True, excluded_tools=()):
         _check_id(namespace)
         self._session = session
         self._portal = portal
@@ -96,7 +96,9 @@ class MCPAdapter:
         self._tools = {}
         policies = capability_policies or {}
         selected = None if exposed_tools is None else frozenset(exposed_tools)
+        excluded = frozenset(excluded_tools)
         found = set()
+        self._hidden = []
         deadline = time.monotonic() + timeout
         cursor = None
         seen = set()
@@ -108,7 +110,12 @@ class MCPAdapter:
                 raise ValueError("Invalid MCP discovery page")
             for tool in tools:
                 name = tool["name"]
-                if selected is not None and name not in selected:
+                if name in excluded or (selected is not None and name not in selected):
+                    try:
+                        capability = self._describe_tool(namespace, tool, policies.get(name, {}))
+                    except (ValueError, TypeError, KeyError):
+                        continue
+                    self._hidden.append(capability)
                     continue
                 self._add_tool(namespace, tool, policies.get(name, {}), deny_writes)
                 found.add(name)
@@ -127,22 +134,24 @@ class MCPAdapter:
     def capabilities(self):
         return tuple(tool[0] for tool in self._tools.values())
 
-    def _add_tool(self, namespace, tool, policy, deny_writes):
+    @property
+    def discovered(self):
+        return self.capabilities + tuple(self._hidden)
+
+    def _describe_tool(self, namespace, tool, policy):
         if self._contains_secret(tool):
             raise ValueError("Sensitive data in MCP tool descriptor")
         name = tool["name"]
         capability_id = _capability_id(namespace, name)
-        if capability_id in self._tools or capability_id == ECHO_CAPABILITY:
+        if capability_id == ECHO_CAPABILITY:
             raise ValueError(f"Duplicate or reserved capability ID: {capability_id}")
         input_schema = tool["inputSchema"]
         output_schema = tool.get("outputSchema")
-        inputs = _validator(input_schema)
-        outputs = None if output_schema is None else _validator(output_schema)
-        capability = Capability(
+        return Capability(
             capability_id,
             tool.get("description") or tool.get("title") or f"MCP tool {name}",
             input_schema,
-            output_schema if outputs is not None else True,
+            output_schema if output_schema is not None else True,
             {
                 "adapter": "mcp",
                 "tool_name": name,
@@ -150,8 +159,15 @@ class MCPAdapter:
             },
             classification=policy.get("classification", _classify(tool.get("annotations"))),
         )
-        self._tools[capability_id] = (
-            capability, name, inputs, outputs, policy.get("deny_writes", deny_writes),
+
+    def _add_tool(self, namespace, tool, policy, deny_writes):
+        capability = self._describe_tool(namespace, tool, policy)
+        if capability.id in self._tools:
+            raise ValueError(f"Duplicate capability ID: {capability.id}")
+        inputs = _validator(tool["inputSchema"])
+        outputs = None if tool.get("outputSchema") is None else _validator(tool["outputSchema"])
+        self._tools[capability.id] = (
+            capability, tool["name"], inputs, outputs, policy.get("deny_writes", deny_writes),
         )
 
     def _contains_secret(self, value):
