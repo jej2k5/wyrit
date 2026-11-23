@@ -37,6 +37,7 @@ with capture.open("a") as stream:
 
 mode = os.environ.get("FAKE_MODE")
 server, = servers
+assert args[args.index("--allowedTools") + 1] == f"mcp__{server}", args
 tools = ["read-status", "write-maintenance"] if server == "bench" else ["search", "execute"]
 blocks = [{"type": "tool_use", "id": f"tool_{name}", "name": f"mcp__{server}__{name}"}
           for name in tools]
@@ -58,13 +59,14 @@ if mode == "timeout":
 elif mode == "exit":
     print("login required", file=sys.stderr)
     sys.exit(7)
-elif mode in {"recorded", "malformed-ledger"}:
+elif mode in {"recorded", "malformed-ledger", "permission-denial"}:
     ledger = Path(os.environ["FAKE_LEDGER"]).read_text()
     if mode == "malformed-ledger":
         ledger = "invalid json\n" + ledger + "{}\n"
     (path.parent / "runs.jsonl").write_text(ledger)
     (path.parent / "requests.jsonl").write_text(json.dumps({
         "request": {"tool": "read-status", "arguments": {}},
+        "outcome": {"tool": "read-status", "outcome": "FAILED"},
     }) + "\n")
 elif mode in {"mcp", "mcp-native"}:
     import anyio
@@ -103,6 +105,8 @@ print(json.dumps({
     "usage": {"input_tokens": 11, "output_tokens": 7,
               "cache_creation_input_tokens": 3, "cache_read_input_tokens": 5},
     "is_error": mode == "limit",
+    "permission_denials": [{"tool_name": blocks[0]["name"], "tool_use_id": blocks[0]["id"]}]
+                          if mode == "permission-denial" else [],
     "result": "Subscription usage limit reached" if mode == "limit"
               else json.dumps({"read": "failed", "write": "denied"}),
 }))
@@ -134,11 +138,12 @@ class ClaudeCodeTests(unittest.TestCase):
                 self.assertIsNone(row["error"])
                 record = self.calls()[-1]
                 args = record["args"]
+                server = "bench" if approach == "direct" else "wyrit"
                 self.assertEqual(args, [
                     "-p", self.task["prompt"] + JSON_INSTRUCTION, "--output-format", "stream-json",
                     "--verbose", "--model", "test-model", "--tools", "", "--strict-mcp-config",
                     "--mcp-config", str(Path(record["cwd"]).parent / "mcp.json"),
-                    "--allowedTools", "mcp__*", "--permission-mode", "dontAsk",
+                    "--allowedTools", f"mcp__{server}", "--permission-mode", "dontAsk",
                     "--no-session-persistence", "--setting-sources", "", "--disable-slash-commands",
                     "--append-system-prompt", SYSTEM[approach],
                 ])
@@ -147,7 +152,6 @@ class ClaudeCodeTests(unittest.TestCase):
                 self.assertFalse(record["api_key_present"])
                 self.assertTrue(record["oauth_preserved"])
                 self.assertFalse(record["github_token_present"])
-                server = "bench" if approach == "direct" else "wyrit"
                 self.assertEqual(set(record["servers"]), {server})
                 command = record["servers"][server]
                 self.assertEqual(command["command"], sys.executable)
@@ -233,7 +237,10 @@ class ClaudeCodeTests(unittest.TestCase):
             main(["run", *options], env=self.env)
         self.assertEqual(missing.exception.code, 2)
         self.assertFalse(self.capture.exists())
-        env = {**self.env, "FAKE_MODE": "limit"}
+        env = {**self.env, "FAKE_MODE": "recorded", "FAKE_LEDGER": str(
+            Path(__file__).resolve().with_name("fixtures") / "bench-runs.jsonl"
+        )}
+        denial_env = {**env, "FAKE_MODE": "permission-denial"}
         self.assertEqual(main(["calibrate", *options], env=env), 0)
         projection_path, = (output / "calibrations").glob("*.json")
         projection = json.loads(projection_path.read_text())
@@ -250,16 +257,46 @@ class ClaudeCodeTests(unittest.TestCase):
         self.assertEqual(main([*run, "--timeout", "1"], env=env), 1)
         self.assertEqual(main([*run, "--driver", "api"], env=env), 1)
         self.assertEqual(len(self.calls()), 2)
-        self.assertEqual(main(run, env=env), 0)
+        self.assertEqual(main(run, env=denial_env), 0)
         self.assertEqual(len(self.calls()), 6)
         report_path, = output.glob("run-*/report.json")
         report = json.loads(report_path.read_text())
         self.assertEqual(report["driver"], "claude-code")
         self.assertEqual(report["cost_label"], COST_LABEL)
         self.assertEqual(len(report["runs"]), 4)
-        self.assertIn("Subscription usage limit reached", report["runs"][0]["error"])
+        self.assertEqual(report["runs"][0]["error"],
+                         "Claude Code denied 1 tool call(s): mcp__bench__read-status")
+        self.assertEqual(report["runs"][0]["downstream_calls"], 1)
+        self.assertTrue(report["runs"][0]["is_error"])
+        for group in (report["overall"], report["per_task"][self.task["id"]]):
+            self.assertEqual(group["approaches"]["direct"]["runs"], 0)
+            self.assertEqual(group["approaches"]["wyrit"]["runs"], 0)
+            self.assertIsNone(group["approaches"]["direct"]["metrics"]["correct"]["mean"])
+            self.assertIsNone(group["wyrit_minus_direct"]["input_tokens"])
+            self.assertEqual(group["wyrit_losses"], [])
         markdown = report_path.with_suffix(".md").read_text()
         self.assertIn("fixed instructions", markdown)
         self.assertIn("cache_read_input_tokens", markdown)
         self.assertIn("Run errors", markdown)
         network.assert_not_called()
+
+    def test_invalid_calibration_does_not_issue_id(self):
+        suite = self.directory / "tasks"
+        suite.mkdir()
+        (suite / "task.json").write_text(json.dumps(self.task))
+        output = self.directory / "results"
+        options = ["calibrate", "--output", str(output), "--tasks", str(suite)]
+        for mode, reason in (
+            ("permission-denial", "Claude Code denied 1 tool call(s): mcp__bench__read-status"),
+            ("mcp", "No downstream calls observed for a task that requires requests"),
+        ):
+            with self.subTest(mode=mode), redirect_stdout(StringIO()) as stdout, redirect_stderr(StringIO()):
+                env = {**self.env, "FAKE_MODE": mode, "FAKE_LEDGER": str(
+                    Path(__file__).resolve().with_name("fixtures") / "bench-runs.jsonl"
+                )}
+                self.assertEqual(main(options, env=env), 1)
+                self.assertIn(reason, stdout.getvalue())
+                if mode == "permission-denial":
+                    self.assertNotIn("No downstream calls observed", stdout.getvalue())
+                self.assertNotIn("Calibration ID", stdout.getvalue())
+                self.assertFalse((output / "calibrations").exists())

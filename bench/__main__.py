@@ -72,7 +72,8 @@ def make_plan(args, tasks, github_available):
     active = [task["id"] for task in tasks if task["id"] not in skipped]
     if not active:
         raise ValueError("No runnable tasks")
-    return {"version": 2, "driver": args.driver, "suite_digest": digest(tasks), "active_tasks": active,
+    return {"version": 3 if args.driver == "claude-code" else 2,
+            "driver": args.driver, "suite_digest": digest(tasks), "active_tasks": active,
             "skipped_tasks": skipped, "approaches": list(APPROACHES),
             "settings": settings, "repetitions": args.repetitions}
 
@@ -98,7 +99,9 @@ def run_suite(tasks, plan, repetitions, model, env):
 def calibrate(tasks, plan, model, env):
     subscription = plan["driver"] == "claude-code"
     cost_label = f" ({COST_LABEL})" if subscription else ""
+    requires_requests = {task["id"] for task in tasks if task.get("required_requests")}
     rows = []
+    invalid = False
     for row in run_suite(tasks, plan, 1, model, env):
         rows.append(row)
         tokens = f"{row['input_tokens']} input + {row['output_tokens']} output"
@@ -110,6 +113,14 @@ def calibrate(tasks, plan, model, env):
               f"correct={row['correct']}", flush=True)
         if row.get("error"):
             print(f"  {row['error']}", flush=True)
+        if row.get("permission_denials"):
+            invalid = True
+        if subscription and row["task"] in requires_requests and not row["downstream_calls"]:
+            print("  No downstream calls observed for a task that requires requests", flush=True)
+            invalid = True
+
+    if invalid:
+        raise ValueError("Calibration failed. Fix the run errors and calibrate again.")
 
     repetitions = plan["repetitions"]
     projection = {

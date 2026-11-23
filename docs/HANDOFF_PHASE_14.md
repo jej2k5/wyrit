@@ -9,6 +9,8 @@ python -m bench calibrate --repetitions 3
 
 Review the per-run correctness and errors and the projected list-price equivalent, subscription usage, and wall time. Paste the printed ID into `read` and press Enter to authorize the full run.
 
+Calibrate again if you have an ID from before the server-level permission fix. Claude Code gets `mcp__bench` in direct runs and `mcp__wyrit` in Wyrit runs. Calibration withholds the ID on any Claude Code permission denial or on zero downstream calls for a task that requires requests.
+
 ```sh
 read -r CALIBRATION_ID
 python -m bench run --repetitions 3 --calibration-id "$CALIBRATION_ID"

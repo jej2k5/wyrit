@@ -40,8 +40,9 @@ def mcp_config(directory, task, approach):
             "env": {"PYTHONPATH": str(ROOT / "src")},
         }}
     path = directory / "mcp.json"
-    path.write_text(canonical({"mcpServers": servers}), encoding="utf-8")
-    return path
+    config = {"mcpServers": servers}
+    path.write_text(canonical(config), encoding="utf-8")
+    return path, config
 
 
 def json_lines(stream):
@@ -80,18 +81,27 @@ def _run_claude(task, approach, settings, env, row):
         directory = Path(temporary)
         cwd = directory / "work"
         cwd.mkdir()
-        config = mcp_config(directory, task, approach)
+        config_path, config = mcp_config(directory, task, approach)
+        allowed_tools = [f"mcp__{name}" for name in sorted(config["mcpServers"])]
         args = [
             "claude", "-p", task["prompt"] + JSON_INSTRUCTION,
             "--output-format", "stream-json", "--verbose", "--model", settings["model"],
-            "--tools", "", "--strict-mcp-config", "--mcp-config", str(config),
-            "--allowedTools", "mcp__*", "--permission-mode", "dontAsk",
+            "--tools", "", "--strict-mcp-config", "--mcp-config", str(config_path),
+            "--allowedTools", *allowed_tools, "--permission-mode", "dontAsk",
             "--no-session-persistence", "--setting-sources", "", "--disable-slash-commands",
             "--append-system-prompt", SYSTEM[approach],
         ]
         excluded = {"ANTHROPIC_API_KEY", "GITHUB_TOKEN"}
         child_env = {key: env[key] for key in env if key not in excluded}
         result, tool_calls, error = invoke(args, cwd, child_env, settings["timeout_seconds"])
+        denials = result.get("permission_denials") or []
+        if denials:
+            names = ", ".join(denial.get("tool_name") or "<unknown>" for denial in denials)
+            denial_error = f"Claude Code denied {len(denials)} tool call(s): {names}"
+            if error:
+                row["process_error"] = error
+            error = denial_error
+            row["permission_denials"] = denials
         usage = result.get("usage") or {}
         tokens = {field: usage.get(field, 0) for field in TOKEN_FIELDS}
         answer = result.get("result", "")
