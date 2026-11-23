@@ -58,6 +58,13 @@ def _capability_id(namespace, name):
     return f"{namespace}.{name}"
 
 
+def _classify(annotations):
+    if (isinstance(annotations, dict) and annotations.get("readOnlyHint") is True
+            and annotations.get("destructiveHint", False) is False):
+        return "read"
+    return "write"
+
+
 class MCPAdapter:
     """Discover once and dispatch through an initialized SDK session on its portal.
 
@@ -66,25 +73,28 @@ class MCPAdapter:
     """
 
     def __init__(self, namespace, session, portal, *, discovery_timeout=5.0,
-                 exposed_tools=None, secrets=()):
+                 exposed_tools=None, secrets=(), deny_writes=True, capability_policies=None):
         fixed_secrets = tuple(secrets)
         portal.call(self._discover, namespace, session, portal, discovery_timeout,
-                    exposed_tools, lambda: fixed_secrets)
+                    exposed_tools, lambda: fixed_secrets, deny_writes, capability_policies)
 
     @classmethod
-    async def discover(cls, namespace, session, portal, *, exposed_tools, secrets, require_all):
+    async def discover(cls, namespace, session, portal, *, exposed_tools, secrets, require_all,
+                       deny_writes=True, capability_policies=None):
         adapter = cls.__new__(cls)
         await adapter._discover(namespace, session, portal, 5.0, exposed_tools, secrets,
+                                deny_writes, capability_policies,
                                 require_all=require_all)
         return adapter
 
     async def _discover(self, namespace, session, portal, timeout, exposed_tools, secrets,
-                        *, require_all=True):
+                        deny_writes, capability_policies, *, require_all=True):
         _check_id(namespace)
         self._session = session
         self._portal = portal
         self._secrets = secrets
         self._tools = {}
+        policies = capability_policies or {}
         selected = None if exposed_tools is None else frozenset(exposed_tools)
         found = set()
         deadline = time.monotonic() + timeout
@@ -100,7 +110,7 @@ class MCPAdapter:
                 name = tool["name"]
                 if selected is not None and name not in selected:
                     continue
-                self._add_tool(namespace, tool)
+                self._add_tool(namespace, tool, policies.get(name, {}), deny_writes)
                 found.add(name)
             cursor = page.get("nextCursor")
             if cursor is None:
@@ -117,7 +127,7 @@ class MCPAdapter:
     def capabilities(self):
         return tuple(tool[0] for tool in self._tools.values())
 
-    def _add_tool(self, namespace, tool):
+    def _add_tool(self, namespace, tool, policy, deny_writes):
         if self._contains_secret(tool):
             raise ValueError("Sensitive data in MCP tool descriptor")
         name = tool["name"]
@@ -138,8 +148,11 @@ class MCPAdapter:
                 "tool_name": name,
                 **{key: tool[key] for key in ("title", "annotations") if key in tool},
             },
+            classification=policy.get("classification", _classify(tool.get("annotations"))),
         )
-        self._tools[capability_id] = (capability, name, inputs, outputs)
+        self._tools[capability_id] = (
+            capability, name, inputs, outputs, policy.get("deny_writes", deny_writes),
+        )
 
     def _contains_secret(self, value):
         return _contains_secret(value, self._secrets())
@@ -170,9 +183,11 @@ class MCPAdapter:
     def dispatch(self, capability_id, args, *, deadline, admit=None):
         """Invoke a capability after the run boundary has checked its grant."""
         try:
-            _, name, inputs, outputs = self._tools[capability_id]
+            capability, name, inputs, outputs, deny_writes = self._tools[capability_id]
         except KeyError:
             raise CallError("DENIED", dispatched=False) from None
+        if capability.classification == "write" and deny_writes is not False:
+            raise CallError("DENIED", dispatched=False)
         try:
             if not isinstance(args, dict):
                 raise ValueError

@@ -31,6 +31,8 @@ class ServerConfig:
     url: str | None = None
     headers: tuple[tuple[str, str], ...] = field(default=(), repr=False)
     limits: dict = field(default_factory=dict, compare=False)
+    deny_writes: bool = True
+    capabilities: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -121,9 +123,32 @@ def _headers(table, location, environ, secrets):
     return tuple(headers.items())
 
 
+def _write_policy(table, location, expose):
+    deny_writes = table.get("deny_writes", True)
+    if type(deny_writes) is not bool:
+        raise ConfigError(f"{location}.deny_writes: expected a boolean")
+    policies = table.get("capabilities", {})
+    if not isinstance(policies, dict):
+        raise ConfigError(f"{location}.capabilities: expected a table")
+    for name, policy in policies.items():
+        if (not isinstance(name, str) or not _TOOL_NAME.fullmatch(name)
+                or (expose is not None and name not in expose)):
+            raise ConfigError(f"{location}.capabilities: expected an exposed MCP tool name")
+        tool = f"{location}.capabilities.{name!r}"
+        _keys(policy, {"classification", "deny_writes"}, tool)
+        if "classification" in policy and policy["classification"] not in ("read", "write"):
+            raise ConfigError(f"{tool}.classification: expected 'read' or 'write'")
+        if "deny_writes" in policy and type(policy["deny_writes"]) is not bool:
+            raise ConfigError(f"{tool}.deny_writes: expected a boolean")
+    return {
+        "deny_writes": deny_writes,
+        "capabilities": {name: dict(policy) for name, policy in policies.items()},
+    }
+
+
 def _server(name, table, environ, secrets):
     location = f"servers.{name!r}"
-    common = {"namespace", "transport", "expose", "limits"}
+    common = {"namespace", "transport", "expose", "limits", "deny_writes", "capabilities"}
     _keys(table, common | {"command", "args", "url", "headers"}, location)
     limits = _limits(table.get("limits", {}), f"{location}.limits")
     namespace = table.get("namespace")
@@ -142,6 +167,7 @@ def _server(name, table, environ, secrets):
     else:
         raise ConfigError(f"{location}.expose: expected 'all' or a list of unique tool names")
 
+    policy = _write_policy(table, location, expose)
     if transport == "stdio":
         _keys(table, common | {"command", "args"}, location)
         command = table.get("command")
@@ -150,7 +176,8 @@ def _server(name, table, environ, secrets):
         args = table.get("args", [])
         if not isinstance(args, list) or any(not isinstance(arg, str) or "\0" in arg for arg in args):
             raise ConfigError(f"{location}.args: expected a list of argument strings")
-        return ServerConfig(name, namespace, transport, expose, command=command, args=tuple(args), limits=limits)
+        return ServerConfig(name, namespace, transport, expose, command=command,
+                            args=tuple(args), limits=limits, **policy)
     if transport == "http":
         _keys(table, common | {"url", "headers"}, location)
         url = table.get("url")
@@ -159,7 +186,8 @@ def _server(name, table, environ, secrets):
         header_table = table.get("headers", {})
         _require_https_for_headers(url, header_table, location)
         headers = _headers(header_table, f"{location}.headers", environ, secrets)
-        return ServerConfig(name, namespace, transport, expose, url=url, headers=headers, limits=limits)
+        return ServerConfig(name, namespace, transport, expose, url=url,
+                            headers=headers, limits=limits, **policy)
     raise ConfigError(f"{location}.transport: expected 'stdio' or 'http'")
 
 
@@ -216,6 +244,7 @@ def validate_config(config):
         namespaces.add(server.namespace)
         table = {
             "namespace": server.namespace, "transport": server.transport, "limits": server.limits,
+            "deny_writes": server.deny_writes, "capabilities": server.capabilities,
             "expose": "all" if server.expose is None else list(server.expose),
         }
         if server.transport == "stdio" and server.url is None and not server.headers:

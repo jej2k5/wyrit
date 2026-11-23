@@ -36,7 +36,8 @@ HEADER = """
 [servers.remote.headers]
 Authorization = { env = "WYRIT_TEST_SECRET", prefix = "Bearer " }
 """
-TOOLS = [{"name": name, "inputSchema": {"type": "object"}} for name in ("listed", "hidden")]
+TOOLS = [{"name": name, "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": True}}
+         for name in ("listed", "hidden")]
 INITIALIZED = {"capabilities": {"tools": {}}, "serverInfo": {"name": "fixture", "version": "1"}}
 
 
@@ -86,6 +87,17 @@ class HostConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigError, "headers.Authorization") as error:
                 load_config(self.path)
         self.assertNotIn(SECRET, str(error.exception))
+
+    def test_invalid_write_policy_refuses_startup(self):
+        for config in (
+            'deny_writes = "false"\n',
+            'capabilities = ["update"]\n',
+            '[servers.local.capabilities.update]\nclassification = "unknown"\n',
+            '[servers.local.capabilities.update]\ndeny_writes = 0\n',
+        ):
+            with self.subTest(config=config), self.assertRaises(ConfigError):
+                self.path.write_text(STDIO + 'command = "python"\n' + config, encoding="utf-8")
+                load_config(self.path)
 
     def test_plaintext_http_rejects_credential_headers(self):
         url = "http://example.invalid/mcp"

@@ -37,9 +37,11 @@ class Capability:
 
     id: str
     description: str
+    classification: str
     _descriptor: str
 
-    def __init__(self, id, description, input_schema, output_schema, adapter_metadata=None):
+    def __init__(self, id, description, input_schema, output_schema, adapter_metadata=None,
+                 *, classification="write"):
         _check_id(id)
         if not isinstance(description, str) or not description.strip():
             raise ValueError("A capability requires a description")
@@ -48,9 +50,12 @@ class Capability:
                 raise TypeError("A schema must be a JSON object or boolean")
         if adapter_metadata is not None and not isinstance(adapter_metadata, dict):
             raise TypeError("Adapter metadata must be a JSON object")
+        if classification not in ("read", "write"):
+            raise ValueError("Expected a read or write classification")
         descriptor = {
             "id": id,
             "description": description,
+            "classification": classification,
             "input_schema": input_schema,
             "output_schema": output_schema,
             "adapter_metadata": adapter_metadata if adapter_metadata is not None else {},
@@ -58,6 +63,7 @@ class Capability:
         _check_json(descriptor)
         object.__setattr__(self, "id", id)
         object.__setattr__(self, "description", description)
+        object.__setattr__(self, "classification", classification)
         object.__setattr__(self, "_descriptor", _serialize(descriptor))
 
     @property
@@ -126,7 +132,7 @@ class CapabilityRegistry:
         return descriptor
 
     def search(self, query, *, limit=10, offset=0):
-        """Return a page of ranked ID and description pairs."""
+        """Return a page of ranked capability summaries."""
         if type(limit) is not int or limit < 1 or type(offset) is not int or offset < 0:
             raise ValueError("Search requires a positive limit and nonnegative offset")
         query = query.strip().casefold()
@@ -149,10 +155,12 @@ class CapabilityRegistry:
                 ))
 
         matches.sort()
-        return [
-            {"id": capability_id, "description": self.resolve(capability_id).description}
-            for _, _, _, capability_id in matches[offset:offset + limit]
-        ]
+        summaries = []
+        for _, _, _, capability_id in matches[offset:offset + limit]:
+            capability = self.resolve(capability_id)
+            summaries.append({"id": capability.id, "description": capability.description,
+                              "classification": capability.classification})
+        return summaries
 
     def authorization_for(self, run_id, capability_ids):
         authorization = RunAuthorization(run_id, capability_ids)

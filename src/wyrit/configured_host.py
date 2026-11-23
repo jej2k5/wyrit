@@ -1,7 +1,7 @@
 """Own configured downstream transports and sessions in the trusted host."""
 
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from os import PathLike
 import subprocess
@@ -145,7 +145,9 @@ class ServerHealth:
 
 class _Server:
     def __init__(self, config: ServerConfig):
-        self.config = config
+        self.config = replace(config, capabilities={
+            name: dict(policy) for name, policy in config.capabilities.items()
+        })
         self.health = ServerHealth("connecting", None, time.time())
         self.adapter = None
         self.generation = 0
@@ -188,6 +190,7 @@ class ConfiguredHost:
             adapter = await MCPAdapter.discover(
                 server.namespace, connection, self._portal, exposed_tools=server.expose,
                 secrets=lambda: connection_secrets | self._secrets, require_all=slot.known is None,
+                deny_writes=server.deny_writes, capability_policies=server.capabilities,
             )
             if connection.closed:
                 break

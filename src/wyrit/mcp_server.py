@@ -26,6 +26,12 @@ def create_server(registry, dispatch=None, *, allowed_capability_ids=None,
         if allowed is None:
             raise ValueError("Static servers require an explicit capability allowlist")
         visible = CapabilityRegistry(registry.resolve(name) for name in allowed)
+
+    def dispatch_read(capability_id, args, *, deadline):
+        if visible.resolve(capability_id).classification == "write":
+            raise CallError("DENIED", dispatched=False)
+        return dispatch(capability_id, args, deadline=deadline)
+
     server = FastMCP("wyrit")
 
     @server.tool()
@@ -53,7 +59,7 @@ def create_server(registry, dispatch=None, *, allowed_capability_ids=None,
             ids, run_dispatch, run_budgets, run_ledger = registry.bind_run(include_settings=True)
             ids = ids if allowed is None else allowed.intersection(ids)
         else:
-            ids, run_dispatch = allowed, dispatch
+            ids, run_dispatch = allowed, dispatch_read if dispatch is not None else None
             run_budgets, run_ledger = budgets, ledger_path
         authorization = RunAuthorization(run_id, ids)
 
@@ -83,8 +89,9 @@ def _run_demo():
         "additionalProperties": False,
     }
     capabilities = (
-        Capability("demo.increment", "Add one to an integer value", row, row),
-        Capability("demo.format", "Format an integer value as text", row, {"type": "string"}),
+        Capability("demo.increment", "Add one to an integer value", row, row, classification="read"),
+        Capability("demo.format", "Format an integer value as text", row, {"type": "string"},
+                   classification="read"),
     )
 
     def dispatch(capability_id, args, *, deadline):

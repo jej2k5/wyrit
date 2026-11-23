@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import sys
 import tempfile
@@ -17,10 +18,12 @@ from mcp.shared.memory import create_connected_server_and_client_session
 from src.wyrit.capabilities import RunAuthorization
 from src.wyrit.configured_host import configured_host
 from src.wyrit.host_config import ConfigError
-from src.wyrit.invocation import InvocationProtocol
+from src.wyrit.invocation import CallError, InvocationProtocol
 from src.wyrit.ledger import read_ledger
 from src.wyrit.mcp_server import create_server
 from src.wyrit.native_sandbox import SandboxUnavailable
+from native_support import require_native
+from test_budgets import PEER
 
 
 FIXTURE = """
@@ -50,9 +53,19 @@ for line in sys.stdin:
             "serverInfo": {"name": "fixture", "version": "1"},
         }
     elif method == "tools/list":
-        result = {"tools": [{"name": name, "inputSchema": {"type": "object"}}
-                            for name in (tool, "change")]}
+        annotations = {
+            tool: {"readOnlyHint": True},
+            "change": {"readOnlyHint": False},
+            "conflict": {"readOnlyHint": True, "destructiveHint": True},
+        }
+        result = {"tools": [
+            {"name": name, "inputSchema": {"type": "object"},
+             **({"annotations": annotations[name]} if name in annotations else {})}
+            for name in (tool, "change", "conflict", "unknown")
+        ]}
     else:
+        with pidfile.with_suffix(".requests").open("a") as log:
+            log.write(params["name"] + "\\n")
         if params["arguments"].get("block"):
             with call_log.open("a") as log:
                 log.write(str(os.getpid()) + "\\n")
@@ -94,7 +107,7 @@ class LiveSessionTests(unittest.TestCase):
 
     def test_drop_marks_action_unknown_and_reconnects_existing_mcp_server(self):
         host = self.enterContext(configured_host(self.write_config(
-            self.server("fixture"), self.server("healthy"),
+            self.server("fixture") + "deny_writes = false\n", self.server("healthy"),
             self.server("broken", command="/usr/bin/false"),
         )))
         portal = self.enterContext(start_blocking_portal())
@@ -198,3 +211,100 @@ class LiveSessionTests(unittest.TestCase):
         self.assertEqual(record["run_id"], result["run_id"])
         self.assertEqual(record["outcome"], "FAILED")
         self.assertFalse(previous_path.exists())
+
+    def policy_client(self, config):
+        host = self.enterContext(configured_host(config))
+        portal = self.enterContext(start_blocking_portal())
+        client = self.enterContext(portal.wrap_async_context_manager(
+            create_connected_server_and_client_session(create_server(host)._mcp_server)
+        ))
+
+        def call(tool, **args):
+            reply = portal.call(client.call_tool, tool, args)
+            self.assertFalse(reply.isError, reply.content)
+            return json.loads(reply.content[0].text)
+
+        return host, call
+
+    def test_default_policy_denial_is_reported_and_logged_without_downstream_call(self):
+        _, call = self.policy_client(self.write_config(
+            'ledger_path = "runs.jsonl"\n', self.server("fixture"),
+        ))
+        self.assertEqual(
+            {item["id"]: item["classification"] for item in call("search", query="fixture")["matches"]},
+            {"fixture.original": "read", "fixture.change": "write",
+             "fixture.conflict": "write", "fixture.unknown": "write"},
+        )
+        frames = [
+            {"type": "call", "call_id": 1, "capability": "fixture.original", "args": {}},
+            {"type": "call", "call_id": 2, "capability": "fixture.change", "args": {},
+             "expect_error": "DENIED"},
+            {"type": "result", "result": "handled"},
+        ]
+        with (
+            patch("src.wyrit.runtime.shutil", wraps=shutil) as paths,
+            patch("src.wyrit.runtime.native_command") as launcher,
+        ):
+            paths.which.return_value = sys.executable
+            launcher.return_value.__enter__.return_value = (
+                [sys.executable, "-I", "-c", PEER, json.dumps(frames)], (),
+            )
+            result = call("execute", source="return 'handled';")
+        self.assert_policy_denial(result, "handled")
+
+    def test_script_can_catch_default_write_denial(self):
+        require_native(self)
+        _, call = self.policy_client(self.write_config(
+            'ledger_path = "runs.jsonl"\n', self.server("fixture"),
+        ))
+        result = call("execute", source="""
+            await tools.call("fixture.original", {});
+            try { await tools.call("fixture.change", {}); }
+            catch (error) { return error.message; }
+        """)
+        self.assert_policy_denial(result, "Capability call denied")
+
+    def assert_policy_denial(self, result, value):
+        self.assertEqual((result["status"], result["value"]), ("SUCCESS", value))
+        self.assertEqual([action["capability"] for action in result["actions"]], ["fixture.original"])
+        record, = read_ledger(self.directory / "runs.jsonl")
+        self.assertEqual(
+            [(entry["capability"], entry["outcome"]) for entry in record["actions"]],
+            [("fixture.original", "SUCCEEDED"), ("fixture.change", "DENIED")],
+        )
+        self.assertEqual((self.directory / "fixture.requests").read_text().splitlines(), ["original"])
+
+    def test_capability_policy_overrides_class_and_write_permission(self):
+        fixture = self.server("fixture")
+        host, call = self.policy_client(self.write_config(fixture, """
+[servers.fixture.capabilities.conflict]
+deny_writes = false
+[servers.fixture.capabilities.original]
+classification = "write"
+"""))
+        self.assertEqual(call("search", query="fixture.original")["matches"][0]["classification"], "write")
+        host.dispatch("fixture.conflict", {}, deadline=time.monotonic() + 2)
+        for name in ("original", "change", "unknown"):
+            with self.subTest(name=name), self.assertRaises(CallError) as error:
+                host.dispatch(f"fixture.{name}", {}, deadline=time.monotonic() + 2)
+            self.assertEqual(error.exception.code, "DENIED")
+            self.assertFalse(error.exception.dispatched)
+        self.assertEqual((self.directory / "fixture.requests").read_text().splitlines(), ["conflict"])
+
+        _, previous_dispatch = host.bind_run()
+        host.reload(self.write_config(fixture, """deny_writes = false
+[servers.fixture.capabilities.conflict]
+deny_writes = true
+[servers.fixture.capabilities.change]
+classification = "read"
+"""))
+        self.assertEqual(call("search", query="fixture.change")["matches"][0]["classification"], "read")
+        with self.assertRaises(CallError) as stale:
+            previous_dispatch("fixture.conflict", {}, deadline=time.monotonic() + 2)
+        self.assertEqual(stale.exception.code, "DISPATCH_UNAVAILABLE")
+        with self.assertRaises(CallError) as denied:
+            host.dispatch("fixture.conflict", {}, deadline=time.monotonic() + 2)
+        self.assertEqual(denied.exception.code, "DENIED")
+        host.dispatch("fixture.unknown", {}, deadline=time.monotonic() + 2)
+        self.assertEqual((self.directory / "fixture.requests").read_text().splitlines(),
+                         ["conflict", "unknown"])

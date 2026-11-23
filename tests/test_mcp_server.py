@@ -57,6 +57,7 @@ class MCPServerTests(unittest.TestCase):
         self.assertEqual(matches[0], {
             "id": "demo.tool-0", "description": "Format a value", "input_schema": {},
             "output_schema": {}, "javascript": 'await tools.call("demo.tool-0", args)',
+            "classification": "write",
         })
         self.assertEqual(self.tool("search", query="private")["matches"], [])
         self.assertEqual(self.tool("search", query=""), {"matches": []})

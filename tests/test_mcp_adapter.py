@@ -40,10 +40,11 @@ first = {
     "annotations": {"readOnlyHint": True}, "_meta": {"credential": secret},
 }
 second = [
-    {"name": "format", "inputSchema": row_schema},
-    {"name": "sample", "inputSchema": object_schema},
-    {"name": "stats", "inputSchema": object_schema},
-    {"name": "external-ref", "inputSchema": {"$ref": "https://example.invalid/schema"}},
+    {"name": "format", "inputSchema": row_schema, "annotations": {"readOnlyHint": True}},
+    {"name": "sample", "inputSchema": object_schema, "annotations": {"readOnlyHint": True}},
+    {"name": "stats", "inputSchema": object_schema, "annotations": {"readOnlyHint": True}},
+    {"name": "external-ref", "inputSchema": {"$ref": "https://example.invalid/schema"},
+     "annotations": {"readOnlyHint": True}},
 ]
 
 for line in sys.stdin:

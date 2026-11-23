@@ -15,6 +15,13 @@ max_output_bytes = 16384  # Per capability response and final return value
 # command = "/absolute/path/to/mcp-server"
 # args = ["--stdio"]
 # expose = "all"
+# deny_writes = true  # Default. Set false to allow writes for this server.
+#
+# [servers.local.capabilities.update_item]
+# deny_writes = false  # Allow this write while the server default stays in force.
+#
+# [servers.local.capabilities.get_item]
+# classification = "read"  # Override the tool's MCP annotations.
 
 # [servers.remote]
 # namespace = "remote"

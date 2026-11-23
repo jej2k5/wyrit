@@ -68,7 +68,9 @@ class CapabilityTests(unittest.TestCase):
                          ["customers.search", "a.search", "b.search", "c.lookup"])
         self.assertEqual(hits, CapabilityRegistry(reversed(items)).search("customers.search"))
         self.assertEqual(registry.search("customers.search", limit=2, offset=1), hits[1:3])
-        self.assertEqual(set(hits[0]), {"id", "description"})
+        self.assertEqual(hits[0], {
+            "id": "customers.search", "description": "Lookup", "classification": "write",
+        })
         self.assertEqual(registry.search(""), [])
         self.assertEqual(registry.search("unmatched"), [])
         self.assertEqual(registry.search("customer records")[0]["id"], "a.search")
