@@ -1,17 +1,16 @@
 """Run a bounded Anthropic tool-use loop through host-owned MCP sessions."""
 
 from contextlib import ExitStack
+from datetime import timedelta
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import monotonic
-from uuid import uuid4
 
 from anyio.from_thread import start_blocking_portal
 from mcp.shared.memory import create_connected_server_and_client_session
 
-from src.wyrit.capabilities import CapabilityRegistry, RunAuthorization
-from src.wyrit.invocation import CallError
+from src.wyrit.capabilities import CapabilityRegistry
 from src.wyrit.mcp_adapter import MCPAdapter
 from src.wyrit.mcp_server import create_server
 
@@ -19,6 +18,7 @@ from .tasks import canonical, check, downstream_server
 
 
 APPROACHES = ("direct", "wyrit")
+JSON_INSTRUCTION = "\nReturn only the requested JSON value."
 SYSTEM = {
     "direct": "Use the supplied MCP tools to complete the task.",
     "wyrit": (
@@ -30,8 +30,59 @@ SYSTEM = {
 }
 
 
+def error_details(error):
+    return {"stop_reason": "error", "is_error": True,
+            "error": f"{type(error).__name__}: {error}", "correct": False}
+
+
+def error_row(error, elapsed):
+    return {
+        "input_tokens": 0, "output_tokens": 0, "model_turns": 0, "wall_seconds": elapsed,
+        "tool_calls": 0, "downstream_calls": 0, "answer": "", "execution_statuses": [],
+        "tool_outcomes": [], **error_details(error),
+    }
+
+
+def read_outcomes(path, tool_names, execution_statuses, outcomes):
+    try:
+        stream = path.open(encoding="utf-8")
+    except FileNotFoundError:
+        return
+    malformed = []
+    with stream:
+        for line_number, line in enumerate(stream, 1):
+            try:
+                run = json.loads(line)
+                if not isinstance(run["outcome"], str) or not isinstance(run["actions"], list):
+                    raise ValueError
+                actions = []
+                for action in run["actions"]:
+                    capability = action.get("capability")
+                    if ((capability is not None and not isinstance(capability, str))
+                            or not isinstance(action["outcome"], str)):
+                        raise ValueError
+                    actions.append({"tool": tool_names(capability), "outcome": action["outcome"]})
+            except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+                malformed.append(line_number)
+                continue
+            execution_statuses.append(run["outcome"])
+            outcomes.extend(actions)
+    if malformed:
+        raise ValueError(f"Malformed runs.jsonl at line {malformed[0]} ({len(malformed)} invalid records)")
+
+
 def run_agent(task, approach, model, settings):
+    start = monotonic()
+    try:
+        return _run_agent(task, approach, model, settings)
+    except Exception as error:
+        return error_row(error, monotonic() - start)
+
+
+def _run_agent(task, approach, model, settings):
     requests = []
+    outcomes = []
+    execution_statuses = []
     with ExitStack() as stack:
         portal = stack.enter_context(start_blocking_portal())
 
@@ -40,34 +91,33 @@ def run_agent(task, approach, model, settings):
                 create_connected_server_and_client_session(server)
             ))
 
-        downstream = connect(downstream_server(task, requests))
+        def record(request, outcome):
+            if request is not None:
+                requests.append(request)
+            if approach == "direct":
+                outcomes.append(outcome)
+
+        downstream = connect(downstream_server(task, record, deny_writes_at_entry=approach == "direct"))
         adapter = MCPAdapter("bench", downstream, portal)
         capabilities = {cap.adapter_metadata["tool_name"]: cap for cap in adapter.capabilities}
         ids = frozenset(cap.id for cap in capabilities.values())
-        outcomes = []
-        execution_statuses = []
         if approach == "direct":
-            run_id = uuid4().hex
-            authorization = RunAuthorization(run_id, ids)
             tools = [
                 {"name": name, "description": cap.description, "input_schema": cap.input_schema}
                 for name, cap in capabilities.items()
             ]
 
             def invoke(name, arguments):
-                capability = capabilities.get(name)
-                if capability is None or not authorization.allows(run_id, capability.id):
-                    return {"code": "DENIED"}, True
-                try:
-                    value = adapter.dispatch(capability.id, arguments, deadline=monotonic() + 10)
-                except CallError as error:
-                    outcome = error.action_status or {
-                        "DENIED": "DENIED", "CALL_TIMEOUT": "UNKNOWN", "OUTCOME_UNKNOWN": "UNKNOWN",
-                    }.get(error.code, "FAILED")
-                    outcomes.append({"tool": name, "outcome": outcome})
-                    return {"code": error.code, "outcome": outcome}, True
-                outcomes.append({"tool": name, "outcome": "SUCCEEDED"})
-                return value, False
+                if name not in capabilities:
+                    return "Unknown MCP tool", True
+                response = portal.call(downstream.call_tool, name, arguments, timedelta(seconds=10))
+                blocks = [block.model_dump(mode="json") for block in response.content]
+                if response.isError:
+                    if len(blocks) == 1 and blocks[0]["type"] == "text":
+                        return blocks[0]["text"], True
+                    return blocks, True
+                result = getattr(response, "structuredContent", None)
+                return (blocks if result is None else result), False
 
         else:
             directory = stack.enter_context(TemporaryDirectory())
@@ -89,63 +139,79 @@ def run_agent(task, approach, model, settings):
                 result = getattr(response, "structuredContent", None)
                 if result is None:
                     blocks = [block.model_dump(mode="json") for block in response.content]
-                    result = (
-                        json.loads(blocks[0]["text"])
-                        if not response.isError and len(blocks) == 1 and blocks[0]["type"] == "text"
-                        else blocks
-                    )
+                    result = blocks
+                    if not response.isError and len(blocks) == 1 and blocks[0]["type"] == "text":
+                        try:
+                            result = json.loads(blocks[0]["text"])
+                        except (ValueError, RecursionError):
+                            pass
                 if name == "execute":
                     execution_statuses.append(result.get("status") if isinstance(result, dict)
                                               else "MCP_ERROR")
                 return result, response.isError
 
         metrics = run_loop(task["prompt"], approach, model, settings, tools, invoke)
-        if approach == "wyrit" and ledger.exists():
-            for line in ledger.read_text(encoding="utf-8").splitlines():
-                for action in json.loads(line)["actions"]:
-                    outcomes.append({"tool": tool_names.get(action["capability"]),
-                                     "outcome": action["outcome"]})
-        try:
-            answer = json.loads(metrics.pop("answer"))
-            correct = metrics["stop_reason"] == "end_turn" and check(task, answer, requests, outcomes)
-        except (ValueError, RecursionError):
-            correct = False
+        if approach == "wyrit":
+            try:
+                read_outcomes(ledger, tool_names.get, [], outcomes)
+            except (OSError, ValueError) as error:
+                details = error_details(error)
+                if metrics.get("error"):
+                    details["error"] = metrics["error"] + "; " + details["error"]
+                metrics.update(details)
+        answer = metrics.pop("answer")
+        correct = metrics["stop_reason"] == "end_turn" and check_answer(task, answer, requests, outcomes)
         return {**metrics, "downstream_calls": len(requests), "correct": correct,
                 "execution_statuses": execution_statuses, "tool_outcomes": outcomes}
 
 
+def check_answer(task, answer, requests, outcomes):
+    try:
+        return check(task, json.loads(answer), requests, outcomes)
+    except (TypeError, ValueError, RecursionError):
+        return False
+
+
 def run_loop(prompt, approach, model, settings, tools, invoke):
-    messages = [{"role": "user", "content": prompt + "\nReturn only the requested JSON value."}]
+    messages = [{"role": "user", "content": prompt + JSON_INSTRUCTION}]
     input_tokens = output_tokens = tool_calls = 0
     answer = ""
     start = monotonic()
-    for turn in range(1, settings["max_turns"] + 1):
-        response = model(
-            model=settings["model"], system=SYSTEM[approach], messages=messages,
-            tools=tools, max_tokens=settings["max_tokens"],
-        )
-        input_tokens += response["usage"]["input_tokens"]
-        output_tokens += response["usage"]["output_tokens"]
-        content = response["content"]
-        stop = response["stop_reason"]
-        if stop != "tool_use":
-            answer = "".join(block["text"] for block in content if block["type"] == "text")
-            break
-        if turn == settings["max_turns"]:
-            stop = "turn_limit"
-            break
-        results = []
-        for block in content:
-            if block["type"] == "tool_use":
-                tool_calls += 1
-                value, is_error = invoke(block["name"], block["input"])
-                results.append({"type": "tool_result", "tool_use_id": block["id"],
-                                "content": canonical(value), "is_error": is_error})
-        if not results:
-            stop = "invalid_tool_response"
-            break
-        messages.extend([{"role": "assistant", "content": content},
-                         {"role": "user", "content": results}])
+    turn = 0
+    failure = {}
+    try:
+        for _ in range(settings["max_turns"]):
+            response = model(
+                model=settings["model"], system=SYSTEM[approach], messages=messages,
+                tools=tools, max_tokens=settings["max_tokens"],
+            )
+            turn += 1
+            input_tokens += response["usage"]["input_tokens"]
+            output_tokens += response["usage"]["output_tokens"]
+            content = response["content"]
+            stop = response["stop_reason"]
+            if stop != "tool_use":
+                answer = "".join(block["text"] for block in content if block["type"] == "text")
+                break
+            if turn == settings["max_turns"]:
+                stop = "turn_limit"
+                break
+            results = []
+            for block in content:
+                if block["type"] == "tool_use":
+                    tool_calls += 1
+                    value, is_error = invoke(block["name"], block["input"])
+                    content_value = value if is_error and isinstance(value, str) else canonical(value)
+                    results.append({"type": "tool_result", "tool_use_id": block["id"],
+                                    "content": content_value, "is_error": is_error})
+            if not results:
+                stop = "invalid_tool_response"
+                break
+            messages.extend([{"role": "assistant", "content": content},
+                             {"role": "user", "content": results}])
+    except Exception as error:
+        failure = error_details(error)
+        stop = "error"
     return {"input_tokens": input_tokens, "output_tokens": output_tokens, "model_turns": turn,
             "wall_seconds": monotonic() - start, "tool_calls": tool_calls, "answer": answer,
-            "stop_reason": stop}
+            "stop_reason": stop, **failure}

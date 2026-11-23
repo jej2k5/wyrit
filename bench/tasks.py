@@ -65,7 +65,7 @@ def github_fixture(task, snapshot):
     }
 
 
-def downstream_server(task, requests):
+def downstream_server(task, record, *, deny_writes_at_entry=False):
     """Serve immutable fixture data over MCP and record requests actually received."""
     server = Server("bench-downstream")
     fixture = task["tools"]
@@ -85,16 +85,23 @@ def downstream_server(task, requests):
 
     async def call_tool(request):
         name, arguments = request.params.name, request.params.arguments or {}
-        requests.append({"tool": name, "arguments": arguments})
         tool = fixture[name]
         case = next((case for case in tool.get("cases", [])
                      if canonical(case["arguments"]) == canonical(arguments)), {})
-        if tool.get("write", False) or "result" not in case:
+        denied = tool.get("write", False) and deny_writes_at_entry
+        failed = tool.get("write", False) or "result" not in case
+        record(None if denied else {"tool": name, "arguments": arguments},
+               {"tool": name, "outcome": "DENIED" if denied else "FAILED" if failed else "SUCCEEDED"})
+        if failed:
+            message = "DENIED: Fixture write denied by policy" if denied else "Fixture tool failed"
             result = types.CallToolResult(
-                content=[types.TextContent(type="text", text="Fixture tool failed")], isError=True,
+                content=[types.TextContent(type="text", text=message)], isError=True,
             )
         else:
-            result = types.CallToolResult(content=[], structuredContent=case["result"])
+            result = types.CallToolResult(
+                content=[types.TextContent(type="text", text=canonical(case["result"]))],
+                structuredContent=case["result"],
+            )
         return types.ServerResult(result)
 
     server.request_handlers[types.CallToolRequest] = call_tool

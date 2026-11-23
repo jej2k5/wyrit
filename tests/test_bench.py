@@ -4,14 +4,18 @@ import json
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from time import monotonic
 import unittest
 from unittest.mock import Mock, patch
 
+from mcp import ClientSession, types
+
 from bench.__main__ import ROOT, main
-from bench.agent import run_agent
+from bench.agent import create_server, run_agent
 from bench.clients import github_snapshot
 from bench.tasks import check, github_fixture, load_tasks
 from native_support import require_native
+from src.wyrit.invocation import CallError
 from src.wyrit.native_sandbox import SandboxUnavailable
 
 
@@ -70,8 +74,8 @@ class BenchTests(unittest.TestCase):
                 return calls(("read-status", {}), ("write-maintenance", {}))
             read, write = request["messages"][-1]["content"]
             self.assertTrue(read["is_error"] and write["is_error"])
-            self.assertEqual(json.loads(read["content"])["code"], "TOOL_ERROR")
-            self.assertEqual(json.loads(write["content"])["code"], "DENIED")
+            self.assertEqual(read["content"], "Fixture tool failed")
+            self.assertEqual(write["content"], "DENIED: Fixture write denied by policy")
             return answer({"read": "failed", "write": "denied"})
 
         row = run_agent(task, "direct", model, SETTINGS)
@@ -93,6 +97,41 @@ class BenchTests(unittest.TestCase):
         self.assertFalse(row["correct"])
         self.assertEqual(row["tool_calls"], 1)
         self.assertEqual(row["downstream_calls"], 0)
+
+    def test_wyrit_recorded_ledger_and_plain_text_result(self):
+        task = TASKS["failure-and-denial"]
+        recorded = Path(__file__).with_name("fixtures") / "bench-runs.jsonl"
+        dispatch = ledger = None
+
+        def configure(registry, adapter_dispatch, **options):
+            nonlocal dispatch, ledger
+            dispatch, ledger = adapter_dispatch, options["ledger_path"]
+            return create_server(registry, adapter_dispatch, **options)
+
+        async def execute(session, name, arguments):
+            self.assertEqual(name, "execute")
+            ledger.write_text(recorded.read_text(encoding="utf-8"), encoding="utf-8")
+            return types.CallToolResult(content=[types.TextContent(type="text", text="plain text")])
+
+        def model(**request):
+            if len(request["messages"]) == 1:
+                with self.assertRaises(CallError):
+                    dispatch("bench.read-status", {}, deadline=monotonic() + 10)
+                return calls(("execute", {"source": "return null;"}))
+            result = json.loads(request["messages"][-1]["content"][0]["content"])
+            block, = result
+            self.assertEqual((block["type"], block["text"]), ("text", "plain text"))
+            return answer(task["expected"])
+
+        with (patch("bench.agent.create_server", side_effect=configure),
+              patch.object(ClientSession, "call_tool", execute)):
+            row = run_agent(task, "wyrit", model, SETTINGS)
+        self.assertTrue(row["correct"], row)
+        self.assertEqual(row["downstream_calls"], 1)
+        self.assertEqual(row["tool_outcomes"], [
+            *task["required_outcomes"], {"tool": None, "outcome": "DENIED"},
+            {"tool": None, "outcome": "DENIED"},
+        ])
 
     def test_wyrit_execute_with_real_sandbox_and_fixture(self):
         require_native(self)
@@ -148,7 +187,7 @@ class BenchTests(unittest.TestCase):
             [], input_tokens=30 if "execute" in {tool["name"] for tool in req["tools"]} else 10,
         ))
         output = Path(self.enterContext(TemporaryDirectory(dir=os.getcwd())))
-        options = ["--output", str(output), "--repetitions", "2"]
+        options = ["--driver", "api", "--output", str(output), "--repetitions", "2"]
         captured = self.enterContext(redirect_stdout(StringIO()))
         self.enterContext(redirect_stderr(StringIO()))
         network = self.enterContext(patch("bench.clients.HTTPSConnection"))
@@ -168,7 +207,7 @@ class BenchTests(unittest.TestCase):
         self.assertAlmostEqual(record["projected_cost_usd"], 0.00126)
         self.assertIn("Projected cost for 12 runs", captured.getvalue())
         self.assertIn("GITHUB_TOKEN is unset", captured.getvalue())
-        self.assertEqual(main(["run", "--output", str(output), "--repetitions", "4",
+        self.assertEqual(main(["run", "--driver", "api", "--output", str(output), "--repetitions", "4",
                                "--calibration-id", calibration.stem], **inject), 1)
         self.assertEqual(main(["run", *options, "--calibration-id", calibration.stem],
                               **{**inject, "env": {"GITHUB_TOKEN": "test-token"}}), 1)
@@ -186,6 +225,36 @@ class BenchTests(unittest.TestCase):
         markdown = report_path.with_suffix(".md").read_text()
         self.assertIn("## failure-and-denial", markdown)
         self.assertIn("Wyrit trails on input_tokens", markdown)
+
+    def test_api_errors_keep_measured_usage_and_write_reports(self):
+        def model(**request):
+            if "execute" in {tool["name"] for tool in request["tools"]}:
+                raise RuntimeError("Anthropic returned HTTP 529")
+            if len(request["messages"]) == 1:
+                return calls(("read-status", {}))
+            raise RuntimeError("Anthropic returned HTTP 429")
+
+        output = Path(self.enterContext(TemporaryDirectory()))
+        suite = output / "tasks"
+        suite.mkdir()
+        (suite / "task.json").write_text(json.dumps(TASKS["failure-and-denial"]))
+        options = ["--driver", "api", "--output", str(output), "--tasks", str(suite),
+                   "--repetitions", "1"]
+        self.enterContext(redirect_stdout(StringIO()))
+        inject = {"model_client": model, "env": {}}
+        self.assertEqual(main(["calibrate", *options], **inject), 0)
+        calibration, = (output / "calibrations").glob("*.json")
+        self.assertEqual(main(["run", *options, "--calibration-id", calibration.stem], **inject), 0)
+        report, = output.glob("run-*/report.json")
+        for path in (calibration, report):
+            direct, wyrit = json.loads(path.read_text())["runs"]
+            self.assertIn("HTTP 429", direct["error"])
+            self.assertEqual(direct["total_tokens"], 18)
+            self.assertGreater(direct["cost_usd"], 0)
+            self.assertEqual(direct["downstream_calls"], 1)
+            self.assertIn("HTTP 529", wyrit["error"])
+            self.assertFalse(wyrit["correct"])
+        self.assertIn("HTTP 429", report.with_suffix(".md").read_text())
 
     def test_github_fixture_gets_fixed_read_only_data_and_checks_each_issue(self):
         with patch("bench.clients.request_json", side_effect=[

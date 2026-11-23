@@ -9,6 +9,7 @@ import sys
 from uuid import uuid4
 
 from .agent import APPROACHES, run_agent
+from .claude_code import COST_LABEL, run_claude
 from .clients import AnthropicMessages, github_snapshot
 from .report import make_report, markdown
 from .tasks import digest, github_fixture, load_tasks
@@ -31,6 +32,9 @@ def parse_args(argv):
         mode = modes.add_parser(command)
         mode.add_argument("--repetitions", type=positive_int, default=3)
         mode.add_argument("--model")
+        mode.add_argument("--driver", choices=("claude-code", "api"), default="claude-code")
+        mode.add_argument("--timeout", type=positive_int, default=600,
+                          help="seconds per Claude Code run (default: 600)")
         mode.add_argument("--tasks", type=Path, default=ROOT / "tasks")
         mode.add_argument("--config", type=Path, default=ROOT / "config.json")
         mode.add_argument("--output", type=Path, default=Path("bench-results"))
@@ -46,39 +50,82 @@ def read_json(path):
 def make_plan(args, tasks, github_available):
     config = read_json(args.config)
     model = args.model if args.model is not None else config["model"]
-    prices = config["prices_per_million"].get(model)
-    if prices is None or any(type(prices.get(key)) not in (int, float)
-                             or not math.isfinite(prices[key]) or prices[key] < 0
-                             for key in ("input", "output")):
-        raise ValueError("Configure finite, nonnegative input and output prices for the selected model")
-    settings = {"model": model, "prices_per_million": prices}
-    for name in ("max_turns", "max_tokens"):
-        value = config[name]
-        if type(value) is not int or value < 1:
-            raise ValueError(f"{name} must be a positive integer")
-        settings[name] = value
+    settings = {"model": model}
+    if args.driver == "api":
+        prices = config["prices_per_million"].get(model)
+        if prices is None or any(type(prices.get(key)) not in (int, float)
+                                 or not math.isfinite(prices[key]) or prices[key] < 0
+                                 for key in ("input", "output")):
+            raise ValueError("Configure finite, nonnegative input and output prices for the selected model")
+        settings["prices_per_million"] = prices
+        for name in ("max_turns", "max_tokens"):
+            value = config[name]
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+            settings[name] = value
+    else:
+        if os.name != "posix":
+            raise ValueError("The Claude Code driver requires POSIX process groups")
+        settings["timeout_seconds"] = args.timeout
     skipped = {task["id"]: "GITHUB_TOKEN is unset" for task in tasks
                if task["kind"] == "github" and not github_available}
     active = [task["id"] for task in tasks if task["id"] not in skipped]
     if not active:
         raise ValueError("No runnable tasks")
-    return {"version": 1, "suite_digest": digest(tasks), "active_tasks": active,
+    return {"version": 2, "driver": args.driver, "suite_digest": digest(tasks), "active_tasks": active,
             "skipped_tasks": skipped, "approaches": list(APPROACHES),
             "settings": settings, "repetitions": args.repetitions}
 
 
-def run_suite(tasks, settings, repetitions, model):
-    prices = settings["prices_per_million"]
+def run_suite(tasks, plan, repetitions, model, env):
+    settings = plan["settings"]
     for repetition in range(1, repetitions + 1):
         for task in tasks:
             # Alternate the order across repetitions to reduce order effects.
             approaches = APPROACHES if repetition % 2 else APPROACHES[::-1]
             for approach in approaches:
-                row = run_agent(task, approach, model, settings)
-                cost = (row["input_tokens"] * prices["input"]
-                        + row["output_tokens"] * prices["output"]) / 1_000_000
-                yield {**row, "task": task["id"], "approach": approach,
-                       "repetition": repetition, "cost_usd": cost}
+                if plan["driver"] == "api":
+                    row = run_agent(task, approach, model, settings)
+                    prices = settings["prices_per_million"]
+                    row["cost_usd"] = (row["input_tokens"] * prices["input"]
+                                       + row["output_tokens"] * prices["output"]) / 1_000_000
+                    row["total_tokens"] = row["input_tokens"] + row["output_tokens"]
+                else:
+                    row = run_claude(task, approach, settings, env)
+                yield {**row, "task": task["id"], "approach": approach, "repetition": repetition}
+
+
+def calibrate(tasks, plan, model, env):
+    subscription = plan["driver"] == "claude-code"
+    cost_label = f" ({COST_LABEL})" if subscription else ""
+    rows = []
+    for row in run_suite(tasks, plan, 1, model, env):
+        rows.append(row)
+        tokens = f"{row['input_tokens']} input + {row['output_tokens']} output"
+        if subscription:
+            tokens += (f" + {row['cache_creation_input_tokens']} cache creation"
+                       f" + {row['cache_read_input_tokens']} cache read")
+        print(f"{row['task']} {row['approach']} · {tokens} tokens · "
+              f"${row['cost_usd']:.8f}{cost_label} · {row['wall_seconds']:.3f} s · "
+              f"correct={row['correct']}", flush=True)
+        if row.get("error"):
+            print(f"  {row['error']}", flush=True)
+
+    repetitions = plan["repetitions"]
+    projection = {
+        "plan": plan, "runs": rows,
+        "projected_cost_usd": sum(row["cost_usd"] for row in rows) * repetitions,
+        "projected_total_tokens": sum(row["total_tokens"] for row in rows) * repetitions,
+        "projected_wall_seconds": sum(row["wall_seconds"] for row in rows) * repetitions,
+    }
+    print(f"Projected cost for {len(rows) * repetitions} runs · "
+          f"${projection['projected_cost_usd']:.8f}{cost_label}")
+    usage_label = "subscription usage" if subscription else "usage"
+    print(f"Projected {usage_label} · {projection['projected_total_tokens']} total tokens")
+    print(f"Projected wall time · {projection['projected_wall_seconds']:.3f} s")
+    if any(row.get("is_error") for row in rows):
+        print("Calibration had errors. The projection uses only the recorded usage and costs.")
+    return projection
 
 
 def validate_projection(args, plan):
@@ -106,7 +153,7 @@ def main(argv=None, *, model_client=None, env=None, snapshot_loader=github_snaps
         plan = make_plan(args, tasks, bool(github_token))
         if args.command == "run":
             validate_projection(args, plan)
-        if model_client is None:
+        if args.driver == "api" and model_client is None:
             key = env.get("ANTHROPIC_API_KEY")
             if not key:
                 raise ValueError("Set ANTHROPIC_API_KEY before running the benchmark")
@@ -121,22 +168,14 @@ def main(argv=None, *, model_client=None, env=None, snapshot_loader=github_snaps
                      for task in tasks]
 
         if args.command == "calibrate":
-            rows = []
-            for row in run_suite(tasks, plan["settings"], 1, model_client):
-                rows.append(row)
-                print(f"{row['task']} {row['approach']} · {row['input_tokens']} input + "
-                      f"{row['output_tokens']} output tokens · ${row['cost_usd']:.8f} · "
-                      f"correct={row['correct']}", flush=True)
-            projected = sum(row["cost_usd"] for row in rows) * args.repetitions
-            projection = {"plan": plan, "runs": rows, "projected_cost_usd": projected}
+            projection = calibrate(tasks, plan, model_client, env)
             projection_id = digest(projection)
             directory = args.output / "calibrations"
             directory.mkdir(parents=True, exist_ok=True)
             write_json(directory / f"{projection_id}.json", projection)
-            print(f"Projected cost for {len(rows) * args.repetitions} runs · ${projected:.8f}")
             print(f"Calibration ID {projection_id}")
         else:
-            rows = list(run_suite(tasks, plan["settings"], args.repetitions, model_client))
+            rows = list(run_suite(tasks, plan, args.repetitions, model_client, env))
             report = make_report(plan, args.calibration_id, rows)
             args.output.mkdir(parents=True, exist_ok=True)
             directory = args.output / f"run-{uuid4().hex}"

@@ -1,25 +1,33 @@
 # Phase 14 handoff
 
-From the repository root, install the project dependencies and load `ANTHROPIC_API_KEY` into the environment. Use Node.js on a host with a supported Wyrit native sandbox. Set `GITHUB_TOKEN` with Issues read access to `jej2k5/mcpxy-test` to include the GitHub task.
+From the repository root, use Python 3.11 or later and a signed-in Claude Code subscription with `claude` on `PATH`. Use Node.js on a macOS or Linux host with a supported Wyrit native sandbox. Optionally set `GITHUB_TOKEN` with Issues read access to `jej2k5/mcpxy-test`.
 
 ```sh
 python -m pip install -e .
 python -m bench calibrate --repetitions 3
 ```
 
-Review the per-run cost and correctness and the projected total. Paste the printed ID when prompted.
+Review the per-run correctness and errors and the projected list-price equivalent, subscription usage, and wall time. Paste the printed ID into `read` and press Enter to authorize the full run.
 
 ```sh
 read -r CALIBRATION_ID
 python -m bench run --repetitions 3 --calibration-id "$CALIBRATION_ID"
 ```
 
-The full run writes Markdown and JSON reports under `bench-results/run-*/`. Use the same options and GitHub token availability for both commands. The estimate uses the editable price table in `bench/config.json`. Pass `--model` to choose a model from that table or `--tasks` to point at a directory of task files. The benchmark README covers the data format and metric definitions. [Benchmark README](../bench/README.md)
+Reports are written to `bench-results/run-*/report.md` and `bench-results/run-*/report.json`. Use matching options and GitHub token availability for both commands. Pass `--model` to choose a model, `--timeout` to change the Claude Code timeout from 600 seconds, or `--tasks` to use a different suite of JSON task files. The GitHub task reads a bounded snapshot once per command so both approaches see the same data for that command. [Benchmark README](../bench/README.md)
 
-The GitHub task reads a bounded live snapshot once for each command. Both agents receive the same issue and comment data through the downstream MCP fixture. GitHub fetch time is outside the timed comparison.
+For API billing, set `ANTHROPIC_API_KEY`, review the price table in `bench/config.json`, and run a separate calibration.
+
+```sh
+python -m bench calibrate --driver api --repetitions 3
+read -r CALIBRATION_ID
+python -m bench run --driver api --repetitions 3 --calibration-id "$CALIBRATION_ID"
+```
+
+Run the offline gate from the checkout root.
 
 ```sh
 python -m unittest discover -s tests
 ```
 
-The offline gate uses a scripted Messages client and in-memory MCP servers. Native execution coverage depends on host support.
+The gate uses scripted Messages responses and a fake Claude Code executable with local MCP fixtures. Tests requiring native sandbox execution skip when the host cannot provide it.

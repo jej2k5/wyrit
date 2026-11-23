@@ -1,0 +1,1 @@
+{"outcome": "SUCCESS", "actions": [{"call_id": 1, "capability": "bench.read-status", "outcome": "FAILED"}, {"call_id": 2, "capability": "bench.write-maintenance", "outcome": "DENIED", "reason": "WRITE_POLICY"}, {"call_id": 3, "capability": null, "outcome": "DENIED"}, {"call_id": 4, "outcome": "DENIED"}]}
