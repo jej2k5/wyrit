@@ -82,6 +82,9 @@ def run_javascript(source, *, run_id, authorization, timeout=None, dispatch=None
                           budgets, audit, actions, call_timeouts, tracks_send)
         except Exception:
             result = RunResult("FAILED", reason="Unexpected runtime failure")
+        limit_hits = [*call_timeouts]
+        if result.limit_hit is not None:
+            limit_hits.append(result.limit_hit)
         result = replace(
             result, actions=tuple(actions),
             unknown_calls=tuple(action.call_id for action in actions if action.status == "UNKNOWN"),
@@ -94,6 +97,7 @@ def run_javascript(source, *, run_id, authorization, timeout=None, dispatch=None
                 "ended_at": time.time(),
                 "outcome": result.status,
                 "limit_hit": result.limit_hit,
+                "limit_hits": limit_hits,
                 "actions": audit,
             })
         except OSError:

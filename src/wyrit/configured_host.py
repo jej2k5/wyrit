@@ -5,8 +5,10 @@ from dataclasses import dataclass, replace
 from datetime import timedelta
 from os import PathLike
 import subprocess
+from sqlite3 import Error as StorageError
 from threading import Lock
 import time
+from uuid import uuid4
 
 import anyio
 from anyio.from_thread import start_blocking_portal
@@ -17,8 +19,10 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from .budgets import RunBudgets
 from .capabilities import CapabilityRegistry, _TOKEN
+from .capture import CaptureStore, sidecar
 from .host_config import ServerConfig, load_config, validate_config
 from .invocation import CallError
+from .ledger import append_record, default_ledger_path, open_ledger
 from .mcp_adapter import MCPAdapter, _contains_secret
 
 
@@ -112,7 +116,7 @@ class _Connection:
                     return result
             finally:
                 self.pending.remove(scope)
-        raise CallError("OUTCOME_UNKNOWN")
+        raise CallError("OUTCOME_UNKNOWN", audit_reason="CONNECTION_DROP")
 
 
 @asynccontextmanager
@@ -153,6 +157,8 @@ class _Server:
         self.generation = 0
         self.known = None
         self.discovered = ()
+        self.session_id = uuid4().hex
+        self.health_record = None
 
 
 class ConfiguredHost:
@@ -167,6 +173,46 @@ class ConfiguredHost:
         self._closed = False
         self._budgets = RunBudgets()
         self._ledger_path = None
+        self._capture_paths = set()
+        self.monitor_id = uuid4().hex
+        self.health_record_error = False
+
+    @property
+    def ledger_path(self):
+        with self._lock:
+            return self._ledger_path or default_ledger_path()
+
+    def _purge_captures(self):
+        with self._lock:
+            paths = tuple(self._capture_paths)
+        for path in paths:
+            try:
+                CaptureStore(path).purge()
+            except (OSError, StorageError):
+                pass
+
+    def _record_health(self, slot, *, removed=False):
+        name = slot.config.name
+        if _contains_secret([name, slot.config.namespace], self._secrets):
+            return
+        record = {
+            "host": self.monitor_id, "session": slot.session_id, "server": name,
+            "namespace": slot.config.namespace, "status": "removed" if removed else slot.health.status,
+            "reason": None if removed else slot.health.reason, "generation": slot.generation,
+            "capabilities": len(self._safe_capabilities(slot.known.values())) if slot.adapter else 0,
+        }
+        if record == slot.health_record:
+            return
+        reconnect = (record["status"] == "connected" and slot.generation > 1
+                     and slot.health_record is not None
+                     and slot.health_record["generation"] != slot.generation)
+        try:
+            with open_ledger(sidecar(self._ledger_path, ".health.jsonl")) as ledger:
+                append_record(ledger, {**record, "at": time.time(), "reconnect": reconnect})
+        except OSError:
+            self.health_record_error = True
+        else:
+            slot.health_record = record
 
     @property
     def health(self):
@@ -183,6 +229,8 @@ class ConfiguredHost:
                 slot.known = {cap.id: cap for cap in adapter.capabilities}
                 slot.discovered = adapter.discovered
             slot.adapter = adapter
+            if self._servers.get(slot.config.name) is slot:
+                self._record_health(slot)
 
     async def _refresh(self, slot, connection, ready):
         server = slot.config
@@ -259,7 +307,16 @@ class ConfiguredHost:
                 self._servers = new
                 self._secrets = config.secrets
                 self._budgets = config.budgets()
+                moved = self._ledger_path != config.ledger_path
+                for name, slot in old.items():
+                    if moved or new.get(name) is not slot:
+                        self._record_health(slot, removed=True)
                 self._ledger_path = config.ledger_path
+                self._capture_paths.add(config.ledger_path or default_ledger_path())
+                for slot in new.values():
+                    if moved:
+                        slot.health_record = None
+                    self._record_health(slot)
             self._stop(slot for name, slot in old.items() if new.get(name) is not slot)
             ready = []
             for name, slot in new.items():
@@ -301,7 +358,9 @@ class ConfiguredHost:
     def close(self):
         with self._reload_lock:
             with self._lock:
-                slots = self._servers.values()
+                slots = tuple(self._servers.values())
+                for slot in slots:
+                    self._record_health(slot, removed=True)
                 self._servers = {}
                 self._closed = True
             self._stop(slots)
@@ -358,18 +417,22 @@ class ConfiguredHost:
         _, dispatch = self.bind_run()
         return dispatch(capability_id, args, deadline=deadline)
 
-    def bind_run(self, *, include_settings=False):
+    def bind_run(self, *, include_settings=False, capture_run=None):
         """Pin a run to the capabilities and connections present at admission."""
         with self._lock:
             routes = self._routes()
             budgets, ledger_path = self._budgets, self._ledger_path
+            secrets = self._secrets
 
         def dispatch(capability_id, args, *, deadline, on_send=None):
             if capability_id not in routes:
                 raise CallError("DENIED", dispatched=False)
             capability, slot, adapter, generation = routes[capability_id]
+            key = (slot.config.name, slot.config.namespace)
+            captured = None
 
             def admit():
+                nonlocal captured
                 with self._lock:
                     if (self._servers.get(slot.config.name) is not slot or slot.adapter is None
                             or slot.generation != generation or slot.known.get(capability_id) != capability
@@ -377,8 +440,18 @@ class ConfiguredHost:
                         raise CallError("DISPATCH_UNAVAILABLE", dispatched=False)
                     if on_send is not None:
                         on_send()
+                    if capture_run is not None:
+                        captured = capture_run.sent(key, capability_id, args, secrets | self._secrets)
 
-            return adapter.dispatch(capability_id, args, deadline=deadline, admit=admit)
+            try:
+                result = adapter.dispatch(capability_id, args, deadline=deadline, admit=admit)
+            except CallError as error:
+                if error.audit_reason == "CONNECTION_DROP":
+                    error.audit_server = slot.config.name
+                raise
+            if captured is not None:
+                capture_run.completed(captured, result)
+            return result
 
         if include_settings:
             return tuple(routes), dispatch, budgets, ledger_path
@@ -389,10 +462,20 @@ class ConfiguredHost:
 def configured_host(config):
     with start_blocking_portal() as portal:
         host = ConfiguredHost(portal)
+
+        async def expire_capture():
+            while True:
+                await anyio.to_thread.run_sync(host._purge_captures)
+                await anyio.sleep(1)
+
+        expiry = None
         try:
             host.reload(config)
+            expiry = portal.start_task_soon(expire_capture)
             yield host
         finally:
+            if expiry is not None:
+                expiry.cancel()
             host.close()
 
 

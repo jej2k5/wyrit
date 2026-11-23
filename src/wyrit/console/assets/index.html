@@ -16,6 +16,9 @@
     <a href="/capabilities" data-target="capabilities">Capabilities</a>
     <a href="/policy" data-target="policy">Policy and limits</a>
   </nav>
+  <nav aria-label="Monitoring">
+    <a href="/monitor" data-target="monitor">Monitoring</a>
+  </nav>
   <label class="theme">Theme
     <select id="theme"><option value="system">System</option><option value="dark">Dark</option><option value="light">Light</option></select>
   </label>
@@ -36,7 +39,11 @@
         <label class="http">Endpoint URL<input name="url" type="url"></label>
         <label class="stdio" hidden>Executable<input name="command"></label>
         <label class="stdio" hidden>Arguments (JSON list)<textarea name="args" rows="2"></textarea></label>
-        <label class="http wide">Header references (JSON object)<textarea name="headers" rows="3" spellcheck="false" placeholder='{"Authorization":{"env":"MCP_API_TOKEN","prefix":"Bearer "}}'></textarea></label>
+        <fieldset class="http wide">
+          <legend>Header references</legend>
+          <div id="header-rows"></div>
+          <button id="add-header" type="button">Add header</button>
+        </fieldset>
         <label class="wide">Exposure ("all" or a JSON list of tool names)<input name="expose" required></label>
         <label class="check"><input type="checkbox" name="enabled"> Enabled</label>
       </div>
@@ -57,6 +64,30 @@
     <div id="policies"></div>
     <div class="toolbar"><h2>Execution limits</h2></div>
     <div id="limits"></div>
+  </section>
+  <section id="monitor" hidden>
+    <div class="toolbar">
+      <label>Window
+        <select id="monitor-window">
+          <option value="hour">Last hour</option>
+          <option value="day">Last day</option>
+          <option value="week">Last week</option>
+        </select>
+      </label>
+      <button id="pause-feed" type="button" aria-pressed="false">Pause feed</button>
+    </div>
+    <p id="monitor-message" role="status" hidden></p>
+    <h2>Live run feed</h2>
+    <div id="run-feed"></div>
+    <h2>Capability activity</h2>
+    <div id="capability-stats"></div>
+    <h2>Server history</h2>
+    <div id="server-history"></div>
+    <h2>Limits hit and writes denied</h2>
+    <div id="policy-history"></div>
+    <h2>Payload capture</h2>
+    <p class="prose">Capture stores arguments, available results and generated code for dispatched calls. It starts off for each server.</p>
+    <div id="capture-settings"></div>
   </section>
 </main>
 <script nonce="@NONCE@">@SCRIPT@</script>

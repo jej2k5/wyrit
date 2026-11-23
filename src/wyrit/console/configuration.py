@@ -3,12 +3,14 @@
 from hashlib import sha256
 import json
 import os
+import re
 from pathlib import Path
 import tempfile
 import tomllib
 from threading import Lock
 
-from ..host_config import ConfigError, load_config, validate_config
+from ..capture import contains_credential
+from ..host_config import ConfigError, _ENV_NAME, load_config, validate_config
 from ..mcp_adapter import _contains_secret
 
 
@@ -22,22 +24,35 @@ def _literal(value):
     raise ConfigError("TOML values must be strings, numbers, booleans, lists or tables.")
 
 
-def _toml(data):
-    lines = []
+def _key(value):
+    return value if re.fullmatch(r"[A-Za-z0-9_-]+", value) else _literal(value)
+
+
+def _toml(data, *, omit_empty=True):
+    blocks = []
 
     def table(path, values):
-        if path:
-            lines.append("[" + ".".join(map(_literal, path)) + "]")
+        lines = []
+        children = []
+        headers = len(path) == 3 and path[0] == "servers" and path[2] == "headers"
         for key, value in values.items():
             if not isinstance(value, dict):
-                lines.append(f"{_literal(key)} = {_literal(value)}")
-        lines.append("")
-        for key, value in values.items():
-            if isinstance(value, dict):
-                table((*path, key), value)
+                lines.append(f"{_key(key)} = {_literal(value)}")
+            elif headers:
+                fields = ", ".join(f"{_key(k)} = {_literal(v)}" for k, v in value.items())
+                inline = f"{{ {fields} }}" if fields else "{}"
+                lines.append(f"{_key(key)} = {inline}")
+            elif value or not omit_empty or path == ("servers",):
+                children.append(((*path, key), value))
+        if lines or (path and not omit_empty) or (len(path) == 2 and path[0] == "servers"):
+            if path:
+                lines.insert(0, "[" + ".".join(map(_key, path)) + "]")
+            blocks.append("\n".join(lines))
+        for child, value in children:
+            table(child, value)
 
     table((), data)
-    return "\n".join(lines).lstrip("\n").encode()
+    return ("\n\n".join(blocks) + ("\n" if blocks else "")).encode()
 
 
 def _stage(path, content):
@@ -116,6 +131,11 @@ class Configuration:
     def apply(self, request):
         original, data = self._read()
         action = request.get("action")
+        if action == "header_status":
+            env = request.get("env")
+            if not isinstance(env, str) or not _ENV_NAME.fullmatch(env):
+                raise ConfigError("Enter a valid environment variable name.")
+            return {"present": bool(os.environ.get(env))}
         if action == "reload":
             self.host.reload(self.path)
             return {"message": "Configuration reloaded."}
@@ -146,13 +166,13 @@ class Configuration:
             self._edit_server(action, request, name, servers, server)
 
         self._remember_secrets(data)
-        if _contains_secret(data, self.secrets) or _contains_secret(original.decode(), self.secrets):
+        if contains_credential(data) or _contains_secret(data, self.secrets) or _contains_secret(original.decode(), self.secrets):
             raise ConfigError("Remove literal credentials and use environment references.")
         if action == "test":
             server = self._server(servers, name)
             if server.get("enabled") is False:
                 server["enabled"] = True
-        candidate = _stage(self.path, _toml(data))
+        candidate = _stage(self.path, _toml(data, omit_empty=False))
         try:
             config = load_config(candidate)
             validate_config(config)
@@ -166,6 +186,11 @@ class Configuration:
 
             if self.path.read_bytes() != original:
                 raise ConfigError("The file changed during the edit. Refresh and try again.")
+            canonical = _stage(self.path, _toml(data))
+            try:
+                os.replace(canonical, candidate)
+            finally:
+                canonical.unlink(missing_ok=True)
             backup = self.path.with_name(self.path.name + ".bak")
             staged_backup = _stage(self.path, original)
             try:

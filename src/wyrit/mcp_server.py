@@ -11,6 +11,7 @@ from anyio import to_thread
 from mcp.server.fastmcp import FastMCP
 
 from .capabilities import Capability, CapabilityRegistry, RunAuthorization
+from .capture import RunCapture
 from .configured_host import ConfiguredHost, configured_host
 from .host_config import ConfigError, load_config
 from .invocation import CallError
@@ -29,7 +30,7 @@ def create_server(registry, dispatch=None, *, allowed_capability_ids=None,
 
     def dispatch_read(capability_id, args, *, deadline):
         if visible.resolve(capability_id).classification == "write":
-            raise CallError("DENIED", dispatched=False)
+            raise CallError("DENIED", dispatched=False, audit_reason="WRITE_POLICY")
         return dispatch(capability_id, args, deadline=deadline)
 
     server = FastMCP("wyrit")
@@ -55,8 +56,11 @@ def create_server(registry, dispatch=None, *, allowed_capability_ids=None,
     async def execute(source: str) -> dict[str, Any]:
         """Run a JavaScript async function body. Use return to produce a JSON value."""
         run_id = uuid4().hex
+        capture = RunCapture(run_id, source) if live else None
         if live:
-            ids, run_dispatch, run_budgets, run_ledger = registry.bind_run(include_settings=True)
+            ids, run_dispatch, run_budgets, run_ledger = registry.bind_run(
+                include_settings=True, capture_run=capture,
+            )
             ids = ids if allowed is None else allowed.intersection(ids)
         else:
             ids, run_dispatch = allowed, dispatch_read if dispatch is not None else None
@@ -64,10 +68,16 @@ def create_server(registry, dispatch=None, *, allowed_capability_ids=None,
         authorization = RunAuthorization(run_id, ids)
 
         def run():
-            return run_javascript(
-                source, run_id=run_id, authorization=authorization, dispatch=run_dispatch,
-                budgets=run_budgets, ledger_path=run_ledger, tracks_send=live,
-            )
+            if capture is not None:
+                capture.start(run_ledger)
+            try:
+                return run_javascript(
+                    source, run_id=run_id, authorization=authorization, dispatch=run_dispatch,
+                    budgets=run_budgets, ledger_path=run_ledger, tracks_send=live,
+                )
+            finally:
+                if capture is not None:
+                    capture.finish()
 
         result = asdict(await to_thread.run_sync(run))
         return {

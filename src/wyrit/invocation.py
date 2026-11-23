@@ -44,12 +44,14 @@ def _check_value(value, depth=0):
 class CallError(Exception):
     """A host adapter failure with a public, fixed protocol code."""
 
-    def __init__(self, code, *, dispatched=True, action_status=None, result_size=None):
+    def __init__(self, code, *, dispatched=True, action_status=None, result_size=None, audit_reason=None):
         super().__init__(code)
         self.code = code
         self.dispatched = dispatched
         self.action_status = action_status
         self.result_size = result_size
+        self.audit_reason = audit_reason
+        self.audit_server = None
 
 
 class DispatchInterrupted(Exception):
@@ -114,6 +116,8 @@ class InvocationProtocol:
         outcome = "DENIED"
         size = None
         namespace = None
+        reason = None
+        server = None
         try:
             if self.admit_call is not None:
                 limits, namespace = self.admit_call(call_id, capability if allowed else None)
@@ -137,6 +141,8 @@ class InvocationProtocol:
                     raise error.cause from None
                 except CallError as error:
                     size = error.result_size
+                    reason = error.audit_reason
+                    server = error.audit_server
                     if error.dispatched:
                         outcome = error.action_status or (
                             "UNKNOWN" if error.code in ("OUTCOME_UNKNOWN", "CALL_TIMEOUT") else "FAILED"
@@ -162,12 +168,18 @@ class InvocationProtocol:
             return self.envelope("call_result", call_id=call_id, result=result)
         finally:
             if self.audit is not None:
-                self.audit.append({
+                record = {
+                    "call_id": call_id,
                     "capability": capability if allowed else None,
                     "outcome": outcome,
                     "duration_seconds": time.monotonic() - start,
                     "result_size_bytes": size,
-                })
+                }
+                if reason is not None:
+                    record["reason"] = reason
+                if server is not None:
+                    record["server"] = server
+                self.audit.append(record)
 
     @staticmethod
     def _check_output(size, limit, namespace):

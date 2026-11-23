@@ -203,7 +203,7 @@ class MCPAdapter:
         except KeyError:
             raise CallError("DENIED", dispatched=False) from None
         if capability.classification == "write" and deny_writes is not False:
-            raise CallError("DENIED", dispatched=False)
+            raise CallError("DENIED", dispatched=False, audit_reason="WRITE_POLICY")
         try:
             if not isinstance(args, dict):
                 raise ValueError

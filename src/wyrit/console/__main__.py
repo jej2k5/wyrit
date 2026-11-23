@@ -8,14 +8,19 @@ import json
 import logging
 from pathlib import Path
 import secrets
+from sqlite3 import Error as StorageError
+from urllib.parse import parse_qs
 
+from ..capture import CaptureStore, contains_credential
 from ..configured_host import configured_host
-from ..host_config import ConfigError
+from ..host_config import ConfigError, load_config
 from ..mcp_adapter import _contains_secret
 from .configuration import Configuration
+from .monitoring import Monitoring, WINDOWS
 
 
-PAGES = {"/": "servers", "/servers": "servers", "/capabilities": "capabilities", "/policy": "policy"}
+PAGES = {"/": "servers", "/servers": "servers", "/capabilities": "capabilities",
+         "/policy": "policy", "/monitor": "monitor"}
 ASSETS = files(__package__).joinpath("assets")
 FONT = "/assets/jetbrains-mono-latin.woff2"
 MAX_BODY = 256 * 1024
@@ -28,7 +33,26 @@ class ConsoleServer(ThreadingHTTPServer):
     def __init__(self, path, host, port):
         self.change_token = secrets.token_urlsafe(32)
         self.configuration = Configuration(path, host, self.change_token)
+        self.monitor = None
         super().__init__(("127.0.0.1", port), ConsoleHandler)
+
+    def server_close(self):
+        super().server_close()
+        if self.monitor is not None:
+            self.monitor.close()
+
+    def monitoring(self):
+        path = self.configuration.host.ledger_path
+        if self.monitor is None or self.monitor.path != path:
+            if self.monitor is not None:
+                self.monitor.close()
+            self.monitor = Monitoring(path)
+        return self.monitor
+
+    def capture_servers(self):
+        config = load_config(self.configuration.path)
+        self.configuration.secrets.update(config.secrets)
+        return [(server.name, server.namespace) for server in config.servers]
 
     def handle_error(self, request, address):
         # Tracebacks can contain downstream data or raw operator input.
@@ -54,7 +78,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self.request_version = "HTTP/1.0"
         nonce = nonce or secrets.token_urlsafe(24)
         if isinstance(content, dict):
-            if _contains_secret(content, self.server.configuration.secrets.copy()):
+            if (contains_credential(content)
+                    or _contains_secret(content, self.server.configuration.secrets.copy())):
                 status, content = 400, {"error": "Remove sensitive data from the configuration or downstream metadata."}
             content = json.dumps(content).encode()
         self.send_response(status)
@@ -97,7 +122,40 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         elif self.path == "/api/state":
             self.run_configuration(self.server.configuration.state)
         else:
-            self.reply(404, {"error": "Open Servers, Capabilities or Policy and limits."})
+            path, _, query = self.path.partition("?")
+            if path in {"/api/monitor", "/api/source", "/api/captures"}:
+                self.run_configuration(lambda: self.monitor_request(path, parse_qs(query, max_num_fields=8)))
+            else:
+                self.reply(404, {"error": "Open Servers, Capabilities, Policy and limits or Monitoring."})
+
+    def monitor_request(self, path, query):
+        monitor = self.server.monitoring()
+        host = self.server.configuration.host
+        store = CaptureStore(monitor.path)
+        if path in {"/api/source", "/api/captures"}:
+            ref, = query.get("ref", [""])
+            if len(ref) > 20 or ref[:1] not in {"r", "h"} or not ref[1:].isascii() or not ref[1:].isdigit():
+                raise ConfigError("Choose a recorded source.")
+            if query.get("epoch") != [monitor.epoch]:
+                raise ConfigError("Refresh Monitoring to restore source links.")
+            record = monitor.source(ref)
+            if record is None:
+                raise ConfigError("Choose a recorded source.")
+            if path == "/api/source":
+                return record
+            if not ref.startswith("r"):
+                raise ConfigError("Choose a run to view its captured payloads.")
+            servers = self.server.capture_servers()
+            return {"payloads": store.payloads(record["record"]["run_id"], servers)}
+        window, = query.get("window", ["hour"])
+        cursor, = query.get("after", ["0"])
+        epoch, = query.get("epoch", [""])
+        if window not in WINDOWS or not 0 <= int(cursor):
+            raise ConfigError("Choose an hour, day or week window.")
+        snapshot = monitor.snapshot(host.monitor_id, window, int(cursor), epoch,
+                                    paused=query.get("paused") == ["1"])
+        snapshot["health_record_error"] = host.health_record_error
+        return snapshot
 
     def do_POST(self):
         if self.path != "/api/config":
@@ -118,7 +176,22 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         except (ValueError, RecursionError, TimeoutError):
             self.reply(400, {"error": "Send a JSON object within the request size limit."})
             return
-        self.run_configuration(lambda: self.server.configuration.apply(request))
+        self.run_configuration(lambda: self.apply(request))
+
+    def apply(self, request):
+        if request.get("action") == "capture_status":
+            servers = self.server.capture_servers()
+            settings = CaptureStore(self.server.configuration.host.ledger_path).settings()
+            return {"servers": [{"name": key[0], "namespace": key[1], "seconds": settings.get(key, 0)}
+                                for key in servers]}
+        if request.get("action") == "capture":
+            key = request.get("name"), request.get("namespace")
+            if key not in self.server.capture_servers():
+                raise ConfigError("Select a configured server.")
+            store = CaptureStore(self.server.configuration.host.ledger_path)
+            store.configure(key, request.get("seconds"))
+            return {"message": "Capture settings saved."}
+        return self.server.configuration.apply(request)
 
     def run_configuration(self, operation):
         with self.server.configuration.lock:
@@ -128,7 +201,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 self.reply(400, {"error": str(error)})
             except (TypeError, ValueError, AttributeError, KeyError, OverflowError, RecursionError):
                 self.reply(400, {"error": "Check the configuration fields and try again."})
-            except (OSError, RuntimeError):
+            except (OSError, RuntimeError, StorageError):
                 self.reply(500, {"error": "Check that the config file and its directory are accessible, then reload."})
             else:
                 self.reply(200, result)

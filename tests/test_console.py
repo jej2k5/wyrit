@@ -13,9 +13,11 @@ import tomllib
 import unittest
 from unittest.mock import patch
 
+from src.wyrit.capture import CaptureStore
 from src.wyrit.configured_host import configured_host
 from src.wyrit.console.__main__ import ConsoleServer
 from src.wyrit.host_config import load_config
+from src.wyrit.ledger import append_record, open_ledger
 
 from test_live_sessions import FIXTURE
 
@@ -70,7 +72,8 @@ class ConsoleTests(unittest.TestCase):
 
     def test_pages_and_font(self):
         for path, page in (("/", "servers"), ("/servers", "servers"),
-                           ("/capabilities", "capabilities"), ("/policy", "policy")):
+                           ("/capabilities", "capabilities"), ("/policy", "policy"),
+                           ("/monitor", "monitor")):
             status, content, csp = self.request(path)
             self.assertEqual(status, 200)
             self.assertIn(f'<body data-page="{page}">'.encode(), content)
@@ -164,6 +167,63 @@ class ConsoleTests(unittest.TestCase):
         _, _, budgets, _ = self.host.bind_run(include_settings=True)
         self.assertEqual(budgets.effective()["max_calls"].value, 5)
         self.assertFalse(self.path.with_suffix(".toml.bak").exists())
+
+    def test_toml_format_and_header_rows(self):
+        self.path.write_text("[limits]\nmax_calls = 32\n", encoding="utf-8")
+        settings = {
+            "namespace": "remote", "transport": "http", "url": "https://peer.invalid/mcp",
+            "expose": "all", "enabled": False, "limits": {},
+            "headers": {"Authorization": {"env": "CONSOLE_TEST_FORMAT", "prefix": "Bearer "}},
+            "capabilities": {"change.item": {"deny_writes": False}},
+        }
+        with patch.dict(os.environ, {"CONSOLE_TEST_FORMAT": "available"}):
+            self.assertEqual(self.change("save", name="remote", settings=settings)[0], 200)
+            self.assertEqual(json.loads(self.change("header_status", env="CONSOLE_TEST_FORMAT")[1]),
+                             {"present": True})
+        expected = (
+            '[limits]\nmax_calls = 32\n\n'
+            '[servers.remote]\nnamespace = "remote"\ntransport = "http"\n'
+            'url = "https://peer.invalid/mcp"\nexpose = "all"\nenabled = false\n\n'
+            '[servers.remote.headers]\nAuthorization = { env = "CONSOLE_TEST_FORMAT", prefix = "Bearer " }\n\n'
+            '[servers.remote.capabilities."change.item"]\ndeny_writes = false\n'
+        )
+        self.assertEqual(self.path.read_text(), expected)
+        handwritten = self.directory / "handwritten.toml"
+        handwritten.write_text(expected)
+        self.assertEqual(load_config(self.path), load_config(handwritten))
+        _, page, _ = self.request("/servers")
+        self.assertIn(b'id="add-header"', page)
+        self.assertNotIn(b"Header references (JSON object)", page)
+        shaped = "ghp_" + "x" * 36
+        settings["headers"]["Authorization"]["prefix"] += shaped
+        self.assertEqual(self.change("save", name="remote", previous="remote", settings=settings)[0], 400)
+        self.assertEqual(self.path.read_text(), expected)
+
+    def test_monitor_sources_and_capture_settings(self):
+        self.path.write_text('ledger_path = "runs.jsonl"\n', encoding="utf-8")
+        self.assertEqual(self.change("reload")[0], 200)
+        settings = {"namespace": "remote", "transport": "http", "expose": "all",
+                    "enabled": False, "url": "https://peer.invalid/mcp"}
+        self.assertEqual(self.change("save", name="remote", settings=settings)[0], 200)
+        store = CaptureStore(self.directory / "runs.jsonl")
+        self.assertEqual(json.loads(self.change("capture_status")[1])["servers"][0]["seconds"], 0)
+        self.assertFalse(store.path.exists())
+        key = {"name": "remote", "namespace": "remote"}
+        self.assertEqual(self.request("/api/config", {"action": "capture", "seconds": 60, **key})[0], 403)
+        self.assertEqual(self.change("capture", seconds=60, **key)[0], 200)
+        self.assertEqual(store.settings(), {("remote", "remote"): 60})
+        record = {"run_id": "sample", "started_at": 1, "ended_at": 2, "outcome": "SUCCESS", "actions": []}
+        with open_ledger(self.directory / "runs.jsonl") as ledger:
+            append_record(ledger, record)
+        status, response, _ = self.request("/api/monitor?window=hour")
+        self.assertEqual(status, 200)
+        data = json.loads(response)
+        self.assertEqual(data["feed"][0]["ref"], "r1")
+        query = f'ref=r1&epoch={data["epoch"]}'
+        self.assertEqual(json.loads(self.request(f"/api/source?{query}")[1])["record"], record)
+        self.assertEqual(json.loads(self.request(f"/api/captures?{query}")[1])["payloads"], [])
+        self.assertEqual(self.change("capture", seconds=0, **key)[0], 200)
+        self.assertEqual(store.settings(), {})
 
     def test_disabled_server_can_show_missing_header(self):
         settings = {

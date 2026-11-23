@@ -107,6 +107,7 @@ class LiveSessionTests(unittest.TestCase):
 
     def test_drop_marks_action_unknown_and_reconnects_existing_mcp_server(self):
         host = self.enterContext(configured_host(self.write_config(
+            'ledger_path = "runs.jsonl"\n',
             self.server("fixture") + "deny_writes = false\n", self.server("healthy"),
             self.server("broken", command="/usr/bin/false"),
         )))
@@ -128,7 +129,7 @@ class LiveSessionTests(unittest.TestCase):
         _, dispatch = host.bind_run()
         protocol = InvocationProtocol(
             "run", RunAuthorization("run", {"fixture.original"}), dispatch=dispatch,
-            deadline=time.monotonic() + 12,
+            deadline=time.monotonic() + 12, audit=[],
         )
         with ThreadPoolExecutor(max_workers=1) as pool:
             action = pool.submit(protocol.respond, protocol.envelope(
@@ -138,9 +139,13 @@ class LiveSessionTests(unittest.TestCase):
             os.kill(pid, signal.SIGKILL)
             self.assertEqual(action.result(timeout=5)["code"], "OUTCOME_UNKNOWN")
         self.assertEqual(protocol.finalize_actions()[0].status, "UNKNOWN")
+        self.assertEqual(protocol.audit[0]["reason"], "CONNECTION_DROP")
+        self.assertEqual(protocol.audit[0]["server"], "fixture")
         unavailable = self.wait_for(lambda: search("fixture").get("unavailable"))
         self.assertIn("session lost", unavailable[0]["reason"])
         self.wait_for(lambda: "fixture.original" in host.ids)
+        history = read_ledger(self.directory / "runs.jsonl.health.jsonl")
+        self.assertTrue(any(row["server"] == "fixture" and row["reconnect"] for row in history))
         self.assertEqual(host.health["healthy"], healthy)
         self.assertEqual(search("fixture.original")["matches"][0]["id"], "fixture.original")
         result = host.dispatch("fixture.original", {}, deadline=time.monotonic() + 3)
