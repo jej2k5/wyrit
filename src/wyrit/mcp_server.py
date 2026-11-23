@@ -2,6 +2,7 @@
 
 import argparse
 from dataclasses import asdict
+import json
 import logging
 from typing import Any
 from uuid import uuid4
@@ -10,39 +11,53 @@ from anyio import to_thread
 from mcp.server.fastmcp import FastMCP
 
 from .capabilities import Capability, CapabilityRegistry, RunAuthorization
-from .configured_host import configured_capabilities
+from .configured_host import ConfiguredHost, configured_host
 from .host_config import ConfigError, load_config
 from .invocation import CallError
 from .runtime import run_javascript
 
 
-def create_server(registry, dispatch, *, allowed_capability_ids):
+def create_server(registry, dispatch=None, *, allowed_capability_ids=None):
     """Build a server for one trust scope using an operator-selected allowlist."""
-    allowed = frozenset(allowed_capability_ids)
-    visible = CapabilityRegistry(registry.resolve(name) for name in allowed)
+    live = isinstance(registry, ConfiguredHost)
+    allowed = None if allowed_capability_ids is None else frozenset(allowed_capability_ids)
+    if not live:
+        if allowed is None:
+            raise ValueError("Static servers require an explicit capability allowlist")
+        visible = CapabilityRegistry(registry.resolve(name) for name in allowed)
     server = FastMCP("wyrit")
 
     @server.tool()
     async def search(query: str) -> dict[str, Any]:
         """Find up to five relevant capabilities with schemas and JavaScript usage."""
-        matches = []
-        for match in visible.search(query, limit=5):
-            capability_id = match["id"]
-            matches.append({
-                **visible.describe(capability_id),
-                "javascript": f'await tools.call("{capability_id}", args)',
-            })
-        return {"matches": matches}
+        if live:
+            descriptors, unavailable = registry.search(query, allowed=allowed)
+        else:
+            descriptors = [visible.describe(match["id"]) for match in visible.search(query, limit=5)]
+            unavailable = []
+        response = {"matches": [
+            {**item, "javascript": "await tools.call(" + json.dumps(item["id"])
+             + ", args)"}
+            for item in descriptors
+        ]}
+        if unavailable:
+            response["unavailable"] = unavailable
+        return response
 
     @server.tool()
     async def execute(source: str) -> dict[str, Any]:
         """Run a JavaScript async function body. Use return to produce a JSON value."""
         run_id = uuid4().hex
-        authorization = RunAuthorization(run_id, allowed)
+        if live:
+            ids, run_dispatch = registry.bind_run()
+            ids = ids if allowed is None else allowed.intersection(ids)
+        else:
+            ids, run_dispatch = allowed, dispatch
+        authorization = RunAuthorization(run_id, ids)
 
         def run():
             return run_javascript(
-                source, run_id=run_id, authorization=authorization, dispatch=dispatch,
+                source, run_id=run_id, authorization=authorization, dispatch=run_dispatch,
             )
 
         result = asdict(await to_thread.run_sync(run))
@@ -99,8 +114,8 @@ def main():
     logging.disable(logging.CRITICAL)
     try:
         config = load_config(args.config)
-        with configured_capabilities(config) as (registry, dispatch):
-            server = create_server(registry, dispatch, allowed_capability_ids=registry.ids)
+        with configured_host(config) as host:
+            server = create_server(host)
             server.run(transport="stdio")
     except ConfigError as exc:
         parser.exit(2, f"wyrit: {exc}\n")

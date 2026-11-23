@@ -6,8 +6,6 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stderr
-from io import StringIO
 from unittest.mock import patch
 
 from anyio import run
@@ -15,10 +13,9 @@ import httpx
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from src.wyrit.configured_host import configured_capabilities
+from src.wyrit.configured_host import configured_capabilities, configured_host
 from src.wyrit.host_config import ConfigError, load_config
 from src.wyrit.invocation import CallError
-from src.wyrit.mcp_server import main
 
 
 SECRET = "gh" + "p_" + "x" * 36
@@ -174,11 +171,10 @@ class HostConfigTests(unittest.TestCase):
         for path in ("error", "redirect"):
             with self.subTest(path=path):
                 requests.clear()
-                config_at(path)
-                stderr = StringIO()
-                with patch.object(sys, "argv", ["wyrit", "--config", str(self.path)]), redirect_stderr(stderr):
-                    with self.assertRaises(SystemExit) as result:
-                        main()
-                self.assertNotEqual(result.exception.code, 0)
-                self.assertNotIn(SECRET, stderr.getvalue())
-                self.assertEqual(requests, [(f"/{path}", "initialize", "Bearer " + SECRET)])
+                with configured_host(config_at(path)) as host:
+                    self.assertEqual(host.ids, ())
+                    self.assertEqual(host.health["remote"].status, "down")
+                    _, unavailable = host.search("remote")
+                    self.assertEqual(unavailable[0]["reason"], "Downstream connection failed")
+                    self.assertNotIn(SECRET, json.dumps(unavailable))
+                    self.assertEqual(requests, [(f"/{path}", "initialize", "Bearer " + SECRET)])

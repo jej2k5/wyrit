@@ -1,33 +1,39 @@
 """Own configured downstream transports and sessions in the trusted host."""
 
-from contextlib import ExitStack, asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass
 from datetime import timedelta
+from os import PathLike
 import subprocess
+from threading import Lock
+import time
 
 import anyio
 from anyio.from_thread import start_blocking_portal
 import httpx
-from mcp import ClientSession
+from mcp import ClientSession, types
 from mcp.client import streamable_http
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
-from .capabilities import CapabilityRegistry
-from .host_config import ConfigError
+from .capabilities import CapabilityRegistry, _TOKEN
+from .host_config import ServerConfig, load_config, validate_config
 from .invocation import CallError
-from .mcp_adapter import MCPAdapter
+from .mcp_adapter import MCPAdapter, _contains_secret
 
 
-async def _reject_redirect(response):
+async def _check_http_response(response):
     # HTTPX runs response hooks before either HTTPX or MCP can follow a redirect.
     if response.has_redirect_location:
         raise httpx.TransportError("Downstream HTTP redirects are disabled")
+    if response.request.method == "POST" and response.status_code == 404:
+        raise httpx.TransportError("Downstream HTTP endpoint or session is unavailable")
 
 
 @asynccontextmanager
 async def _http_streams(server):
     async with httpx.AsyncClient(
         follow_redirects=False, trust_env=False, timeout=httpx.Timeout(30, read=300),
-        event_hooks={"response": [_reject_redirect]},
+        event_hooks={"response": [_check_http_response]},
     ) as client:
         headers = dict(server.headers)
         if hasattr(streamable_http, "streamable_http_client"):
@@ -54,6 +60,60 @@ async def _http_streams(server):
                 tasks.cancel_scope.cancel()
 
 
+class _Connection:
+    """Make EOF visible to the supervisor and outstanding requests."""
+
+    def __init__(self, read):
+        self.read = read
+        self.closed = False
+        self.changed = anyio.Event()
+        self.pending = set()
+
+    async def __aenter__(self):
+        await self.read.__aenter__()
+        return self
+
+    async def __aexit__(self, *exc):
+        self.close()
+        return await self.read.__aexit__(*exc)
+
+    async def __aiter__(self):
+        try:
+            async for message in self.read:
+                yield message
+        finally:
+            self.close()
+
+    def close(self):
+        self.closed = True
+        self.changed.set()
+        for scope in self.pending:
+            scope.cancel()
+
+    async def incoming(self, message):
+        if isinstance(message, types.ServerNotification):
+            if isinstance(message.root, types.ToolListChangedNotification):
+                self.changed.set()
+        elif isinstance(message, httpx.HTTPError):
+            self.close()
+
+    async def send_request(self, *args):
+        return await self.request(self.session.send_request, *args)
+
+    async def request(self, send, *args):
+        if self.closed:
+            raise CallError("DISPATCH_UNAVAILABLE", dispatched=False)
+        with anyio.CancelScope() as scope:
+            self.pending.add(scope)
+            try:
+                result = await send(*args)
+                if not self.closed:
+                    return result
+            finally:
+                self.pending.remove(scope)
+        raise CallError("OUTCOME_UNKNOWN")
+
+
 @asynccontextmanager
 async def _session(server):
     if server.transport == "stdio":
@@ -63,39 +123,241 @@ async def _session(server):
         )
     else:
         transport = _http_streams(server)
-    async with transport as (read, write), ClientSession(read, write) as session:
-        with anyio.fail_after(5):
-            await session.initialize()
-        yield session
+    async with transport as (read, write):
+        connection = _Connection(read)
+        async with ClientSession(connection, write, message_handler=connection.incoming) as session:
+            connection.session = session
+            try:
+                with anyio.fail_after(5):
+                    await connection.request(session.initialize)
+                yield connection
+            finally:
+                connection.close()
+
+
+@dataclass(frozen=True)
+class ServerHealth:
+    status: str
+    reason: str | None
+    last_change: float
+
+
+class _Server:
+    def __init__(self, config: ServerConfig):
+        self.config = config
+        self.health = ServerHealth("connecting", None, time.time())
+        self.adapter = None
+        self.generation = 0
+        self.known = None
+
+
+class ConfiguredHost:
+    """Supervise configured sessions inside the trusted host's portal."""
+
+    def __init__(self, portal):
+        self._portal = portal
+        self._lock = Lock()
+        self._reload_lock = Lock()
+        self._servers = {}
+        self._secrets = frozenset()
+        self._closed = False
+
+    @property
+    def health(self):
+        with self._lock:
+            return {name: slot.health for name, slot in self._servers.items()}
+
+    def _update(self, slot, status, reason=None, adapter=None):
+        with self._lock:
+            if (status, reason) != (slot.health.status, slot.health.reason):
+                slot.health = ServerHealth(status, reason, time.time())
+            if adapter is not None:
+                if slot.adapter is None:
+                    slot.generation += 1
+                slot.known = {cap.id: cap for cap in adapter.capabilities}
+            slot.adapter = adapter
+
+    async def _refresh(self, slot, connection, ready):
+        server = slot.config
+        connection_secrets = self._secrets | frozenset(value for _, value in server.headers)
+        while not connection.closed:
+            connection.changed = anyio.Event()
+            adapter = await MCPAdapter.discover(
+                server.namespace, connection, self._portal, exposed_tools=server.expose,
+                secrets=lambda: connection_secrets | self._secrets, require_all=slot.known is None,
+            )
+            if connection.closed:
+                break
+            self._update(slot, "connected", adapter=adapter)
+            ready.set()
+            while not connection.changed.is_set():
+                if server.transport == "stdio":
+                    await connection.changed.wait()
+                    break
+                # Stateless HTTP may have no persistent stream to report EOF.
+                with anyio.move_on_after(5) as wait:
+                    await connection.changed.wait()
+                if wait.cancel_called:
+                    with anyio.fail_after(2):
+                        await connection.send_request(
+                            types.ClientRequest(types.PingRequest()), types.EmptyResult,
+                        )
+
+    async def _supervise(self, slot, *, task_status):
+        ready = anyio.Event()
+        with anyio.CancelScope() as scope:
+            task_status.started((scope, ready))
+            delay = 0.25
+            while True:
+                reason = "Downstream connection failed"
+                try:
+                    async with _session(slot.config) as connection:
+                        reason = "Downstream tool discovery failed"
+                        try:
+                            await self._refresh(slot, connection, ready)
+                        finally:
+                            connected = slot.health.status == "connected"
+                            if connected:
+                                reason = "Downstream session lost or tool refresh failed"
+                                delay = 0.25
+                            self._update(slot, "down", reason)
+                except Exception:
+                    # Transport and SDK exceptions can contain credentials.
+                    pass
+                finally:
+                    self._update(slot, "down", reason)
+                    ready.set()
+                await anyio.sleep(delay)
+                delay = min(2, delay * 2)
+                self._update(slot, "connecting", reason)
+
+    def reload(self, config):
+        """Apply a validated HostConfig or load and validate a TOML path."""
+        if isinstance(config, (str, PathLike)):
+            config = load_config(config)
+        validate_config(config)
+        with self._reload_lock:
+            if self._closed:
+                raise RuntimeError("Configured host is closed")
+            with self._lock:
+                old = self._servers
+                new = {}
+                for server in config.servers:
+                    slot = old.get(server.name)
+                    new[server.name] = slot if slot and slot.config == server else _Server(server)
+                self._servers = new
+                self._secrets = config.secrets
+            self._stop(slot for name, slot in old.items() if new.get(name) is not slot)
+            ready = []
+            for name, slot in new.items():
+                if old.get(name) is not slot:
+                    slot.task, (slot.scope, started) = self._portal.start_task(self._supervise, slot)
+                    ready.append(started)
+            for started in ready:
+                self._portal.call(started.wait)
+
+    def _stop(self, slots):
+        slots = tuple(slots)
+        for slot in slots:
+            self._portal.call(slot.scope.cancel)
+        for slot in slots:
+            slot.task.result()
+
+    def close(self):
+        with self._reload_lock:
+            with self._lock:
+                slots = self._servers.values()
+                self._servers = {}
+                self._closed = True
+            self._stop(slots)
+
+    def _safe_capabilities(self, capabilities):
+        if not self._secrets:
+            return capabilities
+        return tuple(capability for capability in capabilities
+                     if not _contains_secret(capability.to_dict(), self._secrets))
+
+    def _routes(self):
+        return {
+            capability.id: (capability, slot, slot.adapter, slot.generation)
+            for slot in self._servers.values() if slot.adapter is not None
+            for capability in self._safe_capabilities(slot.known.values())
+        }
+
+    @property
+    def registry(self):
+        with self._lock:
+            return CapabilityRegistry(route[0] for route in self._routes().values())
+
+    @property
+    def ids(self):
+        with self._lock:
+            return tuple(self._routes())
+
+    def search(self, query, *, limit=5, allowed=None):
+        with self._lock:
+            routes = self._routes()
+            visible = CapabilityRegistry(route[0] for key, route in routes.items()
+                                         if allowed is None or key in allowed)
+            terms = set(_TOKEN.findall(query.casefold()))
+            unavailable = []
+            for name, slot in self._servers.items():
+                if slot.adapter is not None or allowed is not None:
+                    continue
+                namespace = slot.config.namespace
+                if _contains_secret([name, namespace], self._secrets):
+                    continue
+                known = CapabilityRegistry(self._safe_capabilities((slot.known or {}).values()))
+                words = set(_TOKEN.findall(f"{name.casefold()} {namespace}"))
+                if slot.config.expose is not None:
+                    words.update(_TOKEN.findall(" ".join(slot.config.expose).casefold()))
+                if terms & words or known.search(query, limit=1):
+                    unavailable.append({
+                        "server": name, "namespace": namespace, "status": slot.health.status,
+                        "reason": slot.health.reason, "last_change": slot.health.last_change,
+                    })
+        matches = [visible.describe(match["id"]) for match in visible.search(query, limit=limit)]
+        return matches, unavailable[:limit]
+
+    def dispatch(self, capability_id, args, *, deadline):
+        _, dispatch = self.bind_run()
+        return dispatch(capability_id, args, deadline=deadline)
+
+    def bind_run(self):
+        """Pin a run to the capabilities and connections present at admission."""
+        with self._lock:
+            routes = self._routes()
+
+        def dispatch(capability_id, args, *, deadline):
+            if capability_id not in routes:
+                raise CallError("DENIED", dispatched=False)
+            capability, slot, adapter, generation = routes[capability_id]
+
+            def admit():
+                with self._lock:
+                    if (self._servers.get(slot.config.name) is not slot or slot.adapter is None
+                            or slot.generation != generation or slot.known.get(capability_id) != capability
+                            or not self._safe_capabilities((capability,))):
+                        raise CallError("DISPATCH_UNAVAILABLE", dispatched=False)
+
+            return adapter.dispatch(capability_id, args, deadline=deadline, admit=admit)
+
+        return tuple(routes), dispatch
+
+
+@contextmanager
+def configured_host(config):
+    with start_blocking_portal() as portal:
+        host = ConfiguredHost(portal)
+        try:
+            host.reload(config)
+            yield host
+        finally:
+            host.close()
 
 
 @contextmanager
 def configured_capabilities(config):
-    """Yield a registry and dispatcher while all configured sessions are open."""
-    with ExitStack() as stack:
-        portal = stack.enter_context(start_blocking_portal())
-        capabilities = []
-        dispatchers = {}
-        for server in config.servers:
-            try:
-                session = stack.enter_context(portal.wrap_async_context_manager(_session(server)))
-                adapter = MCPAdapter(
-                    server.namespace, session, portal,
-                    exposed_tools=server.expose, secrets=config.secrets,
-                )
-            except Exception:
-                raise ConfigError(
-                    f"servers.{server.name!r}.transport/expose: downstream connection or discovery failed"
-                ) from None
-            for capability in adapter.capabilities:
-                capabilities.append(capability)
-                dispatchers[capability.id] = adapter.dispatch
-
-        def dispatch(capability_id, args, *, deadline):
-            try:
-                downstream = dispatchers[capability_id]
-            except KeyError:
-                raise CallError("DENIED", dispatched=False) from None
-            return downstream(capability_id, args, deadline=deadline)
-
-        yield CapabilityRegistry(capabilities), dispatch
+    """Yield an initial registry snapshot and the live dispatcher."""
+    with configured_host(config) as host:
+        yield host.registry, host.dispatch

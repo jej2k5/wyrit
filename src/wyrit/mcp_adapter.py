@@ -24,6 +24,22 @@ _NATIVE_NAME = re.compile(r"[a-z][a-z0-9_-]*")
 _ENCODED_PREFIX = "encoded-"
 
 
+def _contains_secret(value, secrets):
+    if not secrets:
+        return False
+
+    def contains(child):
+        if isinstance(child, str):
+            return any(secret in child for secret in secrets)
+        if isinstance(child, dict):
+            return any(contains(key) or contains(item) for key, item in child.items())
+        if isinstance(child, list):
+            return any(map(contains, child))
+        return False
+
+    return contains(value)
+
+
 def _validator(schema):
     if not isinstance(schema, (dict, bool)):
         raise ValueError("MCP schemas must be JSON objects or booleans")
@@ -51,19 +67,32 @@ class MCPAdapter:
 
     def __init__(self, namespace, session, portal, *, discovery_timeout=5.0,
                  exposed_tools=None, secrets=()):
+        fixed_secrets = tuple(secrets)
+        portal.call(self._discover, namespace, session, portal, discovery_timeout,
+                    exposed_tools, lambda: fixed_secrets)
+
+    @classmethod
+    async def discover(cls, namespace, session, portal, *, exposed_tools, secrets, require_all):
+        adapter = cls.__new__(cls)
+        await adapter._discover(namespace, session, portal, 5.0, exposed_tools, secrets,
+                                require_all=require_all)
+        return adapter
+
+    async def _discover(self, namespace, session, portal, timeout, exposed_tools, secrets,
+                        *, require_all=True):
         _check_id(namespace)
         self._session = session
         self._portal = portal
-        self._secrets = tuple(secrets)
+        self._secrets = secrets
         self._tools = {}
         selected = None if exposed_tools is None else frozenset(exposed_tools)
         found = set()
-        deadline = time.monotonic() + discovery_timeout
+        deadline = time.monotonic() + timeout
         cursor = None
         seen = set()
         for _ in range(MAX_DISCOVERY_PAGES):
             params = {} if cursor is None else {"cursor": cursor}
-            page = self._request("tools/list", params, deadline)
+            page = await self._send("tools/list", params, deadline)
             tools = page.get("tools")
             if not isinstance(tools, list):
                 raise ValueError("Invalid MCP discovery page")
@@ -81,7 +110,7 @@ class MCPAdapter:
             seen.add(cursor)
         else:
             raise ValueError("MCP discovery page limit exceeded")
-        if selected is not None and selected - found:
+        if require_all and selected is not None and selected - found:
             raise ValueError("Explicitly exposed MCP tool was not discovered")
 
     @property
@@ -113,36 +142,32 @@ class MCPAdapter:
         self._tools[capability_id] = (capability, name, inputs, outputs)
 
     def _contains_secret(self, value):
-        if not self._secrets:
-            return False
-        if isinstance(value, str):
-            return any(secret in value for secret in self._secrets)
-        if isinstance(value, dict):
-            return any(self._contains_secret(key) or self._contains_secret(child)
-                       for key, child in value.items())
-        if isinstance(value, list):
-            return any(self._contains_secret(child) for child in value)
-        return False
+        return _contains_secret(value, self._secrets())
 
-    def _request(self, method, params, deadline):
-        # Use the SDK session for framing and correlation. Read the raw result
-        # so schema resolution and content policy stay in this adapter.
-        async def send():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError
-            with fail_after(remaining):
-                result = await self._session.send_request(
-                    types.Request[dict, str](method=method, params=params), types.Result,
-                )
-            return result.model_extra
+    async def _send(self, method, params, deadline, admit=None):
+        # Use the SDK for framing and correlation, keeping content policy here.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError
+        if admit is not None:
+            admit()
+        with fail_after(remaining):
+            result = await self._session.send_request(
+                types.Request[dict, str](method=method, params=params), types.Result,
+            )
+        return result.model_extra
 
+    def _request(self, method, params, deadline, admit):
         if time.monotonic() >= deadline:
             raise TimeoutError
-        future = self._portal.start_task_soon(send)
-        return future.result(timeout=max(0, deadline - time.monotonic()))
+        future = self._portal.start_task_soon(self._send, method, params, deadline, admit)
+        try:
+            return future.result(timeout=max(0, deadline - time.monotonic()))
+        except TimeoutError:
+            future.cancel()
+            raise
 
-    def dispatch(self, capability_id, args, *, deadline):
+    def dispatch(self, capability_id, args, *, deadline, admit=None):
         """Invoke a capability after the run boundary has checked its grant."""
         try:
             _, name, inputs, outputs = self._tools[capability_id]
@@ -160,7 +185,9 @@ class MCPAdapter:
         if time.monotonic() >= deadline:
             raise CallError("DISPATCH_UNAVAILABLE", dispatched=False)
         try:
-            response = self._request("tools/call", {"name": name, "arguments": args}, deadline)
+            response = self._request("tools/call", {"name": name, "arguments": args}, deadline, admit)
+        except CallError:
+            raise
         except Exception:
             # The server may have acted even if the session reports an error.
             raise CallError("OUTCOME_UNKNOWN") from None

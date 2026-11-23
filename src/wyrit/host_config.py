@@ -153,3 +153,44 @@ def load_config(path) -> HostConfig:
         namespaces.add(server.namespace)
         servers.append(server)
     return HostConfig(tuple(servers), frozenset(secrets))
+
+def validate_config(config):
+    """Validate a resolved configuration before it can change live sessions."""
+    if (not isinstance(config, HostConfig) or not isinstance(config.servers, tuple)
+            or not isinstance(config.secrets, frozenset)
+            or any(not isinstance(secret, str) or not secret for secret in config.secrets)):
+        raise ConfigError("config: expected a resolved HostConfig")
+    names = set()
+    namespaces = set()
+    for server in config.servers:
+        if (not isinstance(server, ServerConfig) or not isinstance(server.name, str)
+                or not isinstance(server.namespace, str)
+                or not isinstance(server.args, tuple) or not isinstance(server.headers, tuple)
+                or (server.expose is not None and not isinstance(server.expose, tuple))):
+            raise ConfigError("config.servers: invalid resolved server")
+        if server.name in names or server.namespace in namespaces:
+            raise ConfigError("config.servers: duplicate server name or namespace")
+        names.add(server.name)
+        namespaces.add(server.namespace)
+        table = {
+            "namespace": server.namespace, "transport": server.transport,
+            "expose": "all" if server.expose is None else list(server.expose),
+        }
+        if server.transport == "stdio" and server.url is None and not server.headers:
+            table.update(command=server.command, args=list(server.args))
+        elif server.transport == "http" and server.command is None and not server.args:
+            table["url"] = server.url
+            header_names = set()
+            for header in server.headers:
+                if not isinstance(header, tuple) or len(header) != 2:
+                    raise ConfigError("config.servers: invalid resolved HTTP header")
+                name, value = header
+                if (not isinstance(name, str) or not _HEADER_NAME.fullmatch(name)
+                        or name.lower() in header_names or not isinstance(value, str)
+                        or not re.fullmatch(r"[ -~]+", value) or value != value.strip()
+                        or not any(value.endswith(secret) for secret in config.secrets)):
+                    raise ConfigError("config.servers: invalid resolved HTTP header")
+                header_names.add(name.lower())
+        else:
+            raise ConfigError("config.servers: invalid resolved transport")
+        _server(server.name, table, {}, set())
