@@ -7,6 +7,7 @@ import re
 import tomllib
 from urllib.parse import urlsplit
 
+from .budgets import DEFAULTS, RunBudgets
 from .capabilities import _ID
 from .mcp_adapter import _TOOL_NAME
 
@@ -29,12 +30,18 @@ class ServerConfig:
     args: tuple[str, ...] = ()
     url: str | None = None
     headers: tuple[tuple[str, str], ...] = field(default=(), repr=False)
+    limits: dict = field(default_factory=dict, compare=False)
 
 
 @dataclass(frozen=True)
 class HostConfig:
     servers: tuple[ServerConfig, ...]
     secrets: frozenset[str] = field(repr=False)
+    limits: dict = field(default_factory=dict)
+    ledger_path: Path | None = None
+
+    def budgets(self):
+        return RunBudgets(dict(self.limits), {s.namespace: dict(s.limits) for s in self.servers})
 
 
 def _keys(table, allowed, location):
@@ -42,6 +49,24 @@ def _keys(table, allowed, location):
         raise ConfigError(f"{location}: expected a table")
     for key in table.keys() - allowed:
         raise ConfigError(f"{location}.{key!r}: unknown field")
+
+
+def _limits(table, location):
+    _keys(table, DEFAULTS.keys(), location)
+    for key, value in table.items():
+        valid_type = type(value) is int or (type(value) is float and type(DEFAULTS[key]) is float)
+        if not valid_type or not 0 < value <= 2**53 - 1:
+            raise ConfigError(f"{location}.{key}: expected a positive {type(DEFAULTS[key]).__name__} limit")
+    return dict(table)
+
+
+def _ledger_path(value):
+    if not isinstance(value, str) or not value.strip() or "\0" in value:
+        raise ConfigError("config.ledger_path: expected a nonempty path")
+    try:
+        return Path(value).expanduser()
+    except (OSError, RuntimeError):
+        raise ConfigError("config.ledger_path: could not expand path") from None
 
 
 def _valid_url(value):
@@ -57,6 +82,11 @@ def _valid_url(value):
         )
     except ValueError:
         return False
+
+
+def _require_https_for_headers(url, headers, location):
+    if headers and urlsplit(url).scheme != "https":
+        raise ConfigError(f"{location}.headers: credential headers require HTTPS")
 
 
 def _headers(table, location, environ, secrets):
@@ -93,8 +123,9 @@ def _headers(table, location, environ, secrets):
 
 def _server(name, table, environ, secrets):
     location = f"servers.{name!r}"
-    common = {"namespace", "transport", "expose"}
+    common = {"namespace", "transport", "expose", "limits"}
     _keys(table, common | {"command", "args", "url", "headers"}, location)
+    limits = _limits(table.get("limits", {}), f"{location}.limits")
     namespace = table.get("namespace")
     if not isinstance(namespace, str) or not _ID.fullmatch(namespace):
         raise ConfigError(f"{location}.namespace: expected a capability prefix")
@@ -119,14 +150,16 @@ def _server(name, table, environ, secrets):
         args = table.get("args", [])
         if not isinstance(args, list) or any(not isinstance(arg, str) or "\0" in arg for arg in args):
             raise ConfigError(f"{location}.args: expected a list of argument strings")
-        return ServerConfig(name, namespace, transport, expose, command=command, args=tuple(args))
+        return ServerConfig(name, namespace, transport, expose, command=command, args=tuple(args), limits=limits)
     if transport == "http":
         _keys(table, common | {"url", "headers"}, location)
         url = table.get("url")
         if not _valid_url(url):
             raise ConfigError(f"{location}.url: expected a valid HTTP(S) URL without userinfo or a fragment")
-        headers = _headers(table.get("headers", {}), f"{location}.headers", environ, secrets)
-        return ServerConfig(name, namespace, transport, expose, url=url, headers=headers)
+        header_table = table.get("headers", {})
+        _require_https_for_headers(url, header_table, location)
+        headers = _headers(header_table, f"{location}.headers", environ, secrets)
+        return ServerConfig(name, namespace, transport, expose, url=url, headers=headers, limits=limits)
     raise ConfigError(f"{location}.transport: expected 'stdio' or 'http'")
 
 
@@ -138,8 +171,11 @@ def load_config(path) -> HostConfig:
         raise ConfigError("config: could not read the TOML file") from None
     except ValueError:
         raise ConfigError("config: invalid TOML") from None
-    _keys(data, {"servers"}, "config")
-    tables = data.get("servers")
+    _keys(data, {"servers", "limits", "ledger_path"}, "config")
+    limits = _limits(data.get("limits", {}), "config.limits")
+    path_value = data.get("ledger_path")
+    ledger_path = Path(path).absolute().parent / _ledger_path(path_value) if path_value is not None else None
+    tables = data.get("servers", {})
     if not isinstance(tables, dict):
         raise ConfigError("config.servers: expected a table")
     environ = dict(os.environ)
@@ -152,7 +188,8 @@ def load_config(path) -> HostConfig:
             raise ConfigError(f"servers.{name!r}.namespace: duplicate namespace")
         namespaces.add(server.namespace)
         servers.append(server)
-    return HostConfig(tuple(servers), frozenset(secrets))
+    return HostConfig(tuple(servers), frozenset(secrets), limits, ledger_path)
+
 
 def validate_config(config):
     """Validate a resolved configuration before it can change live sessions."""
@@ -160,6 +197,11 @@ def validate_config(config):
             or not isinstance(config.secrets, frozenset)
             or any(not isinstance(secret, str) or not secret for secret in config.secrets)):
         raise ConfigError("config: expected a resolved HostConfig")
+    _limits(config.limits, "config.limits")
+    if config.ledger_path is not None:
+        if not isinstance(config.ledger_path, Path):
+            raise ConfigError("config.ledger_path: expected a resolved path")
+        _ledger_path(str(config.ledger_path))
     names = set()
     namespaces = set()
     for server in config.servers:
@@ -173,7 +215,7 @@ def validate_config(config):
         names.add(server.name)
         namespaces.add(server.namespace)
         table = {
-            "namespace": server.namespace, "transport": server.transport,
+            "namespace": server.namespace, "transport": server.transport, "limits": server.limits,
             "expose": "all" if server.expose is None else list(server.expose),
         }
         if server.transport == "stdio" and server.url is None and not server.headers:
@@ -194,3 +236,5 @@ def validate_config(config):
         else:
             raise ConfigError("config.servers: invalid resolved transport")
         _server(server.name, table, {}, set())
+        if server.transport == "http":
+            _require_https_for_headers(server.url, server.headers, f"servers.{server.name!r}")

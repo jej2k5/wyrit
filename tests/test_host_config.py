@@ -14,7 +14,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from src.wyrit.configured_host import configured_capabilities, configured_host
-from src.wyrit.host_config import ConfigError, load_config
+from src.wyrit.host_config import ConfigError, HostConfig, ServerConfig, load_config, validate_config
 from src.wyrit.invocation import CallError
 
 
@@ -86,6 +86,20 @@ class HostConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigError, "headers.Authorization") as error:
                 load_config(self.path)
         self.assertNotIn(SECRET, str(error.exception))
+
+    def test_plaintext_http_rejects_credential_headers(self):
+        url = "http://example.invalid/mcp"
+        self.path.write_text(HTTP + f'url = "{url}"\n' + HEADER, encoding="utf-8")
+        server = ServerConfig("remote", "remote", "http", None, url=url,
+                              headers=(("Authorization", f"Bearer {SECRET}"),))
+        config = HostConfig((server,), frozenset({SECRET}))
+        for validate in (lambda: load_config(self.path), lambda: validate_config(config)):
+            with self.assertRaisesRegex(ConfigError, "credential headers require HTTPS") as error:
+                validate()
+            self.assertNotIn(SECRET, str(error.exception))
+
+        self.path.write_text(HTTP + f'url = "{url}"\n', encoding="utf-8")
+        validate_config(load_config(self.path))
 
     def test_stdio_search_respects_exposure(self):
         fixture = self.path.with_name("fake_stdio.py")

@@ -2,6 +2,8 @@ import os
 import sys
 import unittest
 from contextlib import AsyncExitStack, ExitStack, asynccontextmanager
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 from native_support import require_native
 
@@ -124,6 +126,7 @@ class MCPAdapterTests(unittest.TestCase):
     def setUp(self):
         require_native(self)
         stack = self.enterContext(ExitStack())
+        self.ledger = Path(stack.enter_context(TemporaryDirectory())) / "runs.jsonl"
         stack.enter_context(patch.dict(os.environ, {"WYRIT_MCP_TEST_CREDENTIAL": "host-test-canary"}))
         portal = stack.enter_context(start_blocking_portal())
         session = stack.enter_context(portal.wrap_async_context_manager(session_for_fixture()))
@@ -134,6 +137,7 @@ class MCPAdapterTests(unittest.TestCase):
         grant = authorization or self.registry.authorization_for("run", [f"demo.{n}" for n in names])
         return run_javascript(
             source, run_id="run", authorization=grant, dispatch=self.adapter.dispatch, timeout=timeout,
+            ledger_path=self.ledger,
         )
 
     def test_discovers_and_composes_tools_without_guest_authority(self):
@@ -207,7 +211,7 @@ class MCPAdapterTests(unittest.TestCase):
         self.assertEqual(self.run_js("""
             const small = await tools.call("demo.sample", {case: "small"});
             const errors = [];
-            for (const kind of ["invalid", "resource", "large", "aggregate", "text", "failure", "rpc"]) {
+            for (const kind of ["invalid", "resource", "large", "aggregate", "failure", "rpc"]) {
                 try { await tools.call("demo.sample", {case: kind}); }
                 catch (error) { errors.push(error.message); }
             }
@@ -216,22 +220,33 @@ class MCPAdapterTests(unittest.TestCase):
             return [small, errors, await tools.call("demo.stats", {})];
         """, "sample", "increment", "stats"), RunResult("SUCCESS", [
             {"content": [{"type": "image", "data": "AQI=", "mimeType": "image/png"}]},
-            ["Invalid capability response"] * 2 + ["Capability response too large"] * 3
+            ["Invalid capability response"] * 2 + ["Capability response too large"] * 2
             + ["Capability tool reported an error", "Capability outcome unknown",
                "Invalid capability response"],
-            {"sample": 8, "increment": 1, "stats": 1},
-        ], unknown_calls=(2, 8, 9), actions=(
+            {"sample": 7, "increment": 1, "stats": 1},
+        ], unknown_calls=(2, 7, 8), actions=(
             ActionRecord(1, "demo.sample", "SUCCEEDED"),
             ActionRecord(2, "demo.sample", "UNKNOWN", "INVALID_RESULT"),
             ActionRecord(3, "demo.sample", "SUCCEEDED", "INVALID_RESULT"),
             ActionRecord(4, "demo.sample", "SUCCEEDED", "RESULT_TOO_LARGE"),
             ActionRecord(5, "demo.sample", "SUCCEEDED", "RESULT_TOO_LARGE"),
             ActionRecord(6, "demo.sample", "SUCCEEDED", "RESULT_TOO_LARGE"),
-            ActionRecord(7, "demo.sample", "FAILED", "TOOL_ERROR"),
-            ActionRecord(8, "demo.sample", "UNKNOWN", "OUTCOME_UNKNOWN"),
-            ActionRecord(9, "demo.increment", "UNKNOWN", "INVALID_RESULT"),
-            ActionRecord(10, "demo.stats", "SUCCEEDED"),
+            ActionRecord(6, "demo.sample", "FAILED", "TOOL_ERROR"),
+            ActionRecord(7, "demo.sample", "UNKNOWN", "OUTCOME_UNKNOWN"),
+            ActionRecord(8, "demo.increment", "UNKNOWN", "INVALID_RESULT"),
+            ActionRecord(9, "demo.stats", "SUCCEEDED"),
         )))
+
+    def test_oversized_result_stops_run_after_recording_successful_action(self):
+        result = self.run_js("""
+            try { await tools.call("demo.sample", {case: "text"}); } catch {}
+            return await tools.call("demo.stats", {});
+        """, "sample", "stats")
+        self.assertEqual(result.status, "FAILED")
+        self.assertEqual(result.limit_hit["name"], "max_output_bytes")
+        self.assertEqual(result.actions, (
+            ActionRecord(1, "demo.sample", "SUCCEEDED", "RESULT_TOO_LARGE"),
+        ))
 
     def test_deadline_preserves_unknown_call_and_stops_run(self):
         result = self.run_js(

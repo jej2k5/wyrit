@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 from anyio.from_thread import start_blocking_portal
 from mcp.shared.memory import create_connected_server_and_client_session
@@ -17,7 +18,9 @@ from src.wyrit.capabilities import RunAuthorization
 from src.wyrit.configured_host import configured_host
 from src.wyrit.host_config import ConfigError
 from src.wyrit.invocation import InvocationProtocol
+from src.wyrit.ledger import read_ledger
 from src.wyrit.mcp_server import create_server
+from src.wyrit.native_sandbox import SandboxUnavailable
 
 
 FIXTURE = """
@@ -163,3 +166,35 @@ class LiveSessionTests(unittest.TestCase):
             host.reload(self.write_config(self.server("kept", extra=("changed",)), added))
             self.assertNotEqual(pid("kept"), kept_pid)
             self.assertEqual(pid("added"), added_pid)
+
+    def test_execute_reads_reloaded_budgets_and_ledger_path(self):
+        fixture = self.server("fixture")
+        limits = '[servers.fixture.limits]\nmax_calls = {}\n'
+        host = self.enterContext(configured_host(self.write_config(
+            'ledger_path = "first.jsonl"\n', fixture, limits.format(2),
+        )))
+        pid = (self.directory / "fixture").read_text()
+        _, _, previous, previous_path = host.bind_run(include_settings=True)
+        host.reload(self.write_config('ledger_path = "second.jsonl"\n', fixture, limits.format(1)))
+        self.assertEqual((self.directory / "fixture").read_text(), pid)
+        self.assertEqual(previous.effective("fixture")["max_calls"].value, 2)
+        self.assertEqual(previous_path, self.directory / "first.jsonl")
+
+        portal = self.enterContext(start_blocking_portal())
+        server = create_server(host)
+        client = self.enterContext(portal.wrap_async_context_manager(
+            create_connected_server_and_client_session(server._mcp_server)
+        ))
+        with (
+            patch("src.wyrit.runtime.shutil.which", return_value="/trusted/node"),
+            patch("src.wyrit.runtime.native_command", side_effect=SandboxUnavailable("sandbox unavailable")),
+        ):
+            reply = portal.call(client.call_tool, "execute", {"source": "return 42;"})
+        self.assertFalse(reply.isError)
+        result = json.loads(reply.content[0].text)
+        self.assertEqual(result["limits"]["servers"]["fixture"]["max_calls"],
+                         {"value": 1, "source": "server"})
+        record, = read_ledger(self.directory / "second.jsonl")
+        self.assertEqual(record["run_id"], result["run_id"])
+        self.assertEqual(record["outcome"], "FAILED")
+        self.assertFalse(previous_path.exists())

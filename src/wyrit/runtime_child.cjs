@@ -14,13 +14,14 @@ async function main() {
         throw new Error("Invalid runtime startup message");
     }
     const failure = JSON.stringify({ version, run_id, type: "error", code: "EXECUTION_FAILED" });
+    const oversized = JSON.stringify({ version, run_id, type: "error", code: "OUTPUT_TOO_LARGE" });
     const context = vm.createContext(Object.create(null), {
         codeGeneration: { strings: false, wasm: false },
     });
 
     // Only guest-realm functions are exposed. The driver exchanges strings
     // with the controller and never injects host objects into the context.
-    const bootstrap = function (limit, version, run_id, failure) {
+    const bootstrap = function (limit, version, run_id, failure, oversized) {
         "use strict";
         const encode = JSON.stringify;
         const decode = JSON.parse;
@@ -47,21 +48,24 @@ async function main() {
             TOOL_ERROR: "Capability tool reported an error",
             OUTCOME_UNKNOWN: "Capability outcome unknown",
             INVALID_RESULT: "Invalid capability response",
+            CALL_TIMEOUT: "Capability call timed out",
             RESULT_TOO_LARGE: "Capability response too large",
         };
         let callId = 0;
         let pending;
         let final;
         let fatal;
+        const tooLarge = new ErrorType();
 
         function serialize(value) {
             let budget = limit;
             function snapshot(item, depth) {
-                if (--budget < 0 || depth > 64) throw new ErrorType();
+                if (--budget < 0) throw tooLarge;
+                if (depth > 64) throw new ErrorType();
                 switch (typeof item) {
                     case "string":
                         budget -= item.length;
-                        if (budget < 0) throw new ErrorType();
+                        if (budget < 0) throw tooLarge;
                         return item;
                     case "undefined":
                     case "symbol":
@@ -84,7 +88,8 @@ async function main() {
                 const result = array ? setPrototypeOf([], null) : { __proto__: null };
                 const keys = ownKeys(item);
                 const count = keys.length - (array ? 1 : 0);
-                if (count > budget || (array && descriptor(item, "length").value !== count)) {
+                if (count > budget) throw tooLarge;
+                if (array && descriptor(item, "length").value !== count) {
                     throw new ErrorType();
                 }
                 for (let index = 0; index < keys.length; index++) {
@@ -95,7 +100,8 @@ async function main() {
                     }
                     budget -= key.length;
                     const property = descriptor(item, key);
-                    if (budget < 0 || !property || !property.enumerable || !owns(property, "value")) {
+                    if (budget < 0) throw tooLarge;
+                    if (!property || !property.enumerable || !owns(property, "value")) {
                         throw new ErrorType();
                     }
                     result[key] = snapshot(property.value, depth + 1);
@@ -103,7 +109,7 @@ async function main() {
                 return result;
             }
             const wire = encode(snapshot(value, 0));
-            if (wire.length > limit) throw new ErrorType();
+            if (wire.length > limit) throw tooLarge;
             return wire;
         }
 
@@ -112,9 +118,15 @@ async function main() {
                 throw new ErrorType("Invalid or concurrent capability call");
             }
             const nextId = callId + 1;
-            const wire = serialize({
-                __proto__: null, version, run_id, type: "call", call_id: nextId, capability, args,
-            });
+            let wire;
+            try {
+                wire = serialize({
+                    __proto__: null, version, run_id, type: "call", call_id: nextId, capability, args,
+                });
+            } catch (error) {
+                if (error === tooLarge) throw new ErrorType("Capability arguments too large");
+                throw error;
+            }
             // Proxy traps can reenter tools.call during snapshotting.
             if (final || fatal || pending) throw new ErrorType("Concurrent capability call");
             callId = nextId;
@@ -133,12 +145,12 @@ async function main() {
                 try {
                     const result = await apply(program, undefined, []);
                     final = serialize({ __proto__: null, version, run_id, type: "result", result });
-                } catch {
-                    fatal = true;
+                } catch (error) {
+                    fatal = error === tooLarge ? oversized : failure;
                 }
             },
             next() {
-                if (fatal) return failure;
+                if (fatal) return fatal;
                 if (pending && pending.wire) {
                     const wire = pending.wire;
                     pending.wire = undefined;
@@ -167,7 +179,7 @@ async function main() {
             }
         });
     };
-    const bootstrapArgs = [messageBytes, version, run_id, failure].map(value => JSON.stringify(value));
+    const bootstrapArgs = [messageBytes, version, run_id, failure, oversized].map(value => JSON.stringify(value));
     const controller = vm.runInContext("(" + bootstrap + ")(" + bootstrapArgs.join(",") + ")", context);
 
     try {
@@ -186,7 +198,8 @@ async function main() {
         const wire = controller.next();
         if (wire === undefined) continue;
         if (Buffer.byteLength(wire) > messageBytes) {
-            process.stdout.write(failure + "\n");
+            const report = JSON.parse(wire).type === "result" ? oversized : failure;
+            process.stdout.write(report + "\n");
             return;
         }
         if (!process.stdout.write(wire + "\n")) {

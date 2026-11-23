@@ -15,6 +15,7 @@ from mcp import ClientSession, types
 from mcp.client import streamable_http
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
+from .budgets import RunBudgets
 from .capabilities import CapabilityRegistry, _TOKEN
 from .host_config import ServerConfig, load_config, validate_config
 from .invocation import CallError
@@ -161,6 +162,8 @@ class ConfiguredHost:
         self._servers = {}
         self._secrets = frozenset()
         self._closed = False
+        self._budgets = RunBudgets()
+        self._ledger_path = None
 
     @property
     def health(self):
@@ -247,6 +250,8 @@ class ConfiguredHost:
                     new[server.name] = slot if slot and slot.config == server else _Server(server)
                 self._servers = new
                 self._secrets = config.secrets
+                self._budgets = config.budgets()
+                self._ledger_path = config.ledger_path
             self._stop(slot for name, slot in old.items() if new.get(name) is not slot)
             ready = []
             for name, slot in new.items():
@@ -323,12 +328,13 @@ class ConfiguredHost:
         _, dispatch = self.bind_run()
         return dispatch(capability_id, args, deadline=deadline)
 
-    def bind_run(self):
+    def bind_run(self, *, include_settings=False):
         """Pin a run to the capabilities and connections present at admission."""
         with self._lock:
             routes = self._routes()
+            budgets, ledger_path = self._budgets, self._ledger_path
 
-        def dispatch(capability_id, args, *, deadline):
+        def dispatch(capability_id, args, *, deadline, on_send=None):
             if capability_id not in routes:
                 raise CallError("DENIED", dispatched=False)
             capability, slot, adapter, generation = routes[capability_id]
@@ -339,9 +345,13 @@ class ConfiguredHost:
                             or slot.generation != generation or slot.known.get(capability_id) != capability
                             or not self._safe_capabilities((capability,))):
                         raise CallError("DISPATCH_UNAVAILABLE", dispatched=False)
+                    if on_send is not None:
+                        on_send()
 
             return adapter.dispatch(capability_id, args, deadline=deadline, admit=admit)
 
+        if include_settings:
+            return tuple(routes), dispatch, budgets, ledger_path
         return tuple(routes), dispatch
 
 

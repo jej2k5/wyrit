@@ -1,6 +1,8 @@
 import json
 import os
 import shutil
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import time
 import unittest
 from unittest.mock import Mock, patch
@@ -10,6 +12,7 @@ from mcp.shared.memory import create_connected_server_and_client_session
 
 from native_support import require_native
 from test_mcp_adapter import session_for_fixture
+from src.wyrit.budgets import RunBudgets
 from src.wyrit.capabilities import Capability, CapabilityRegistry
 from src.wyrit.mcp_adapter import MCPAdapter
 from src.wyrit.mcp_server import create_server
@@ -19,7 +22,11 @@ from src.wyrit.native_sandbox import SandboxUnavailable
 class MCPServerTests(unittest.TestCase):
     def connect(self, registry, dispatch, allowed):
         portal = self.enterContext(start_blocking_portal())
-        server = create_server(registry, dispatch, allowed_capability_ids=allowed)
+        directory = self.enterContext(TemporaryDirectory(dir=os.getcwd()))
+        server = create_server(
+            registry, dispatch, allowed_capability_ids=allowed,
+            budgets=RunBudgets({"run_deadline": 2.0}), ledger_path=Path(directory) / "runs.jsonl",
+        )
         self.session = self.enterContext(portal.wrap_async_context_manager(
             create_connected_server_and_client_session(server._mcp_server)
         ))
@@ -71,6 +78,9 @@ class MCPServerTests(unittest.TestCase):
         launch.assert_not_called()
         dispatch.assert_not_called()
         self.assertNotEqual(first["run_id"], second["run_id"])
+        self.assertEqual(first.pop("limits")["global"]["run_deadline"], {"value": 2.0, "source": "global"})
+        self.assertIsNone(first.pop("limit_hit"))
+        self.assertIsNone(first.pop("ledger_error"))
         self.assertEqual(first, {
             "run_id": first["run_id"], "status": "FAILED", "value": None,
             "reason": "No supported native sandbox available",

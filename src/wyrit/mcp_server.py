@@ -17,7 +17,8 @@ from .invocation import CallError
 from .runtime import run_javascript
 
 
-def create_server(registry, dispatch=None, *, allowed_capability_ids=None):
+def create_server(registry, dispatch=None, *, allowed_capability_ids=None,
+                  budgets=None, ledger_path=None):
     """Build a server for one trust scope using an operator-selected allowlist."""
     live = isinstance(registry, ConfiguredHost)
     allowed = None if allowed_capability_ids is None else frozenset(allowed_capability_ids)
@@ -49,15 +50,17 @@ def create_server(registry, dispatch=None, *, allowed_capability_ids=None):
         """Run a JavaScript async function body. Use return to produce a JSON value."""
         run_id = uuid4().hex
         if live:
-            ids, run_dispatch = registry.bind_run()
+            ids, run_dispatch, run_budgets, run_ledger = registry.bind_run(include_settings=True)
             ids = ids if allowed is None else allowed.intersection(ids)
         else:
             ids, run_dispatch = allowed, dispatch
+            run_budgets, run_ledger = budgets, ledger_path
         authorization = RunAuthorization(run_id, ids)
 
         def run():
             return run_javascript(
                 source, run_id=run_id, authorization=authorization, dispatch=run_dispatch,
+                budgets=run_budgets, ledger_path=run_ledger, tracks_send=live,
             )
 
         result = asdict(await to_thread.run_sync(run))

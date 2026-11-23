@@ -188,6 +188,8 @@ class MCPAdapter:
             response = self._request("tools/call", {"name": name, "arguments": args}, deadline, admit)
         except CallError:
             raise
+        except TimeoutError:
+            raise CallError("CALL_TIMEOUT") from None
         except Exception:
             # The server may have acted even if the session reports an error.
             raise CallError("OUTCOME_UNKNOWN") from None
@@ -198,8 +200,9 @@ class MCPAdapter:
                 raise ValueError("Sensitive data in MCP result")
             _check_json(result)
             _check_value(result, 1)
-            if len(encode(result)) > MESSAGE_BYTES:
-                raise CallError("RESULT_TOO_LARGE", action_status="SUCCEEDED")
+            size = len(encode(result))
+            if size > MESSAGE_BYTES:
+                raise CallError("RESULT_TOO_LARGE", action_status="SUCCEEDED", result_size=size)
             return result
         except (ValidationError, Unresolvable, TypeError, ValueError, RecursionError):
             raise CallError("INVALID_RESULT", action_status="UNKNOWN") from None
@@ -246,7 +249,11 @@ def _adapt(response, outputs):
         else:
             raise ValueError("Invalid MCP content block")
     if remaining < 0:
-        raise CallError("RESULT_TOO_LARGE", action_status="SUCCEEDED")
+        # Valid base64 contributes one JSON byte per character.
+        data_bytes = sum(len(block["data"]) for block in content if "data" in block)
+        skeleton = [{**block, "data": ""} if "data" in block else block for block in content]
+        size = data_bytes + len(encode({"content": skeleton})) if not unsupported_content else None
+        raise CallError("RESULT_TOO_LARGE", action_status="SUCCEEDED", result_size=size)
     if unsupported_content:
         raise CallError("INVALID_RESULT", action_status="SUCCEEDED")
     return {"content": content}
