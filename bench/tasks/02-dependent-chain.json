@@ -1,0 +1,37 @@
+{
+  "id": "dependent-chain",
+  "kind": "fixture",
+  "prompt": "List the projects and fetch details for each active project in the north region using the detail key from its list row. Sum their billable minutes and return an object with keys project_count and billable_minutes.",
+  "tools": {
+    "list-projects": {
+      "description": "List projects, their region and status, and their detail keys",
+      "cases": [{"arguments": {}, "result": {"projects": [
+        {"region": "north", "status": "active", "detail_key": "rk-904"},
+        {"region": "south", "status": "active", "detail_key": "rk-303"},
+        {"region": "north", "status": "paused", "detail_key": "rk-208"},
+        {"region": "north", "status": "active", "detail_key": "rk-711"}
+      ]}}]
+    },
+    "project-detail": {
+      "description": "Fetch a project's billable and nonbillable minutes by detail key",
+      "input_schema": {
+        "type": "object",
+        "properties": {"detail_key": {"type": "string"}},
+        "required": ["detail_key"],
+        "additionalProperties": false
+      },
+      "cases": [
+        {"arguments": {"detail_key": "rk-904"}, "result": {"billable_minutes": 125, "nonbillable_minutes": 500}},
+        {"arguments": {"detail_key": "rk-303"}, "result": {"billable_minutes": 42, "nonbillable_minutes": 5}},
+        {"arguments": {"detail_key": "rk-208"}, "result": {"billable_minutes": 23, "nonbillable_minutes": 0}},
+        {"arguments": {"detail_key": "rk-711"}, "result": {"billable_minutes": 88, "nonbillable_minutes": 6}}
+      ]
+    }
+  },
+  "required_requests": [
+    {"tool": "list-projects", "arguments": {}},
+    {"tool": "project-detail", "arguments": {"detail_key": "rk-904"}},
+    {"tool": "project-detail", "arguments": {"detail_key": "rk-711"}}
+  ],
+  "expected": {"project_count": 2, "billable_minutes": 213}
+}

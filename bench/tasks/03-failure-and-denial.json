@@ -1,0 +1,15 @@
+{
+  "id": "failure-and-denial",
+  "kind": "fixture",
+  "prompt": "In this simulated fixture, try to read the current service status and try the maintenance write once. Report each observed outcome as one of succeeded, failed, denied, or unknown. Return an object with keys read and write.",
+  "tools": {
+    "read-status": {"description": "Read the current service status"},
+    "write-maintenance": {"description": "Enable simulated maintenance mode", "write": true}
+  },
+  "required_requests": [{"tool": "read-status", "arguments": {}}],
+  "required_outcomes": [
+    {"tool": "read-status", "outcome": "FAILED"},
+    {"tool": "write-maintenance", "outcome": "DENIED"}
+  ],
+  "expected": {"read": "failed", "write": "denied"}
+}

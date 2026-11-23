@@ -1,0 +1,33 @@
+{
+  "id": "mismatches",
+  "kind": "fixture",
+  "prompt": "Compare the warehouse inventory with the storefront inventory. Keep active warehouse rows only, join by sku, and consider only SKUs present in both inventories. Return a JSON array of mismatches sorted by sku, with keys sku, warehouse, and storefront in each object.",
+  "tools": {
+    "warehouse-inventory": {
+      "description": "List warehouse inventory with SKU, active flag, and stock quantity",
+      "cases": [{"arguments": {}, "result": {"rows": [
+        {"sku": "D4", "active": true, "quantity": 4},
+        {"sku": "A1", "active": true, "quantity": 6},
+        {"sku": "B2", "active": false, "quantity": 2},
+        {"sku": "C3", "active": true, "quantity": 8},
+        {"sku": "E5", "active": true, "quantity": 7}
+      ]}}]
+    },
+    "storefront-inventory": {
+      "description": "List storefront inventory with SKU and stock quantity",
+      "cases": [{"arguments": {}, "result": {"rows": [
+        {"sku": "B2", "quantity": 9}, {"sku": "A1", "quantity": 5},
+        {"sku": "C3", "quantity": 8}, {"sku": "D4", "quantity": 0},
+        {"sku": "F6", "quantity": 8}
+      ]}}]
+    }
+  },
+  "required_requests": [
+    {"tool": "warehouse-inventory", "arguments": {}},
+    {"tool": "storefront-inventory", "arguments": {}}
+  ],
+  "expected": [
+    {"sku": "A1", "warehouse": 6, "storefront": 5},
+    {"sku": "D4", "warehouse": 4, "storefront": 0}
+  ]
+}

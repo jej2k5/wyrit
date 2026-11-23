@@ -1,0 +1,6 @@
+{
+  "id": "github-comments",
+  "kind": "github",
+  "prompt": "List the selected issues in jej2k5/mcpxy-test and read the provided comment excerpts for each issue. Count how many individual excerpts contain the substring 'test', ignoring case. Return an object with key count.",
+  "contains": "test"
+}
