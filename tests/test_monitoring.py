@@ -1,5 +1,6 @@
 """Offline coverage for monitoring projections, rotation and capture retention."""
 
+from contextlib import closing
 import json
 from pathlib import Path
 import sqlite3
@@ -7,7 +8,7 @@ import tempfile
 import time
 import unittest
 
-from src.wyrit.capture import CaptureStore, RunCapture, sidecar
+from src.wyrit.capture import DEFAULT_SOURCE_SECONDS, CaptureStore, RunCapture, sidecar
 from src.wyrit.configured_host import configured_host
 from src.wyrit.console.monitoring import Monitoring, percentile
 from src.wyrit.ledger import append_record, open_ledger
@@ -69,6 +70,8 @@ class MonitoringTests(unittest.TestCase):
         self.assertEqual([item["label"] for item in strip["attention"]], [
             "backup is down", "FAILED action rate above the previous 23 hours",
             "DENIED action rate above the previous 23 hours",
+            "Runs with writes denied in the last hour (1)", "Runs that hit max_calls (1)",
+            "UNKNOWN actions in the last hour (1)",
         ])
         self.assertEqual([row["record"]["run_id"] for row in hour["feed"]], ["legacy", "current", "prior-day", "prior-week"])
         self.assertEqual(hour["capabilities"], [{
@@ -84,6 +87,23 @@ class MonitoringTests(unittest.TestCase):
         self.assertEqual(hour["limits"], [{"ref": "r3", "name": "max_calls", "value": 4}])
         self.assertEqual(self.monitor.source("r3")["record"]["actions"][3], unknown)
         self.assertEqual(self.monitor.source("h3")["line"], 3)
+
+    def test_attention_without_baseline(self):
+        deadline = {"name": "run_deadline", "value": 5}
+        denied = self.action("DENIED", 1, reason="WRITE_POLICY")
+        self.append(self.path,
+                    self.run_row("success", 7, [self.action("SUCCEEDED", 1)]),
+                    *(self.run_row("timeout", age, limit=deadline) | {"outcome": "TIMED_OUT"}
+                      for age in (6, 5, 4)),
+                    self.run_row("write-one", 3, [denied]),
+                    self.run_row("write-two", 2, [denied]),
+                    self.run_row("failure", 1) | {"outcome": "FAILED"})
+        self.assertEqual(self.snapshot()["health"]["attention"], [
+            {"label": "DENIED actions in the last hour (2)", "refs": ["r5", "r6"]},
+            {"label": "Failed runs in the last hour (1)", "refs": ["r7"]},
+            {"label": "Runs with writes denied in the last hour (2)", "refs": ["r5", "r6"]},
+            {"label": "Runs that hit run_deadline (3)", "refs": ["r2", "r3", "r4"]},
+        ])
 
     def test_percentile_boundaries(self):
         self.assertIsNone(percentile([], 0.95))
@@ -129,18 +149,20 @@ class CaptureTests(unittest.TestCase):
             store = CaptureStore(root / "runs.jsonl", clock=lambda: 1)
             key = ("peer", "peer")
             store.configure(key, 60)
-            store.save(key, "run", store.setting(key), {"source": "return 1;"}, set())
+            store.save(key, "run", store.setting(key), {"arguments": {}}, set())
+            store.configure_source(key, 60)
+            store.save_source("run", "return 1;", {key}, store.source_policies())
 
-            def payload_count():
-                with sqlite3.connect(store.path) as db:
-                    return db.execute("SELECT count(*) FROM payloads").fetchone()[0]
+            def captured_counts():
+                with closing(sqlite3.connect(store.path)) as db:
+                    return db.execute("SELECT (SELECT count(*) FROM payloads), (SELECT count(*) FROM sources)").fetchone()
 
-            self.assertEqual(payload_count(), 1)
+            self.assertEqual(captured_counts(), (1, 1))
             with configured_host(config):
                 deadline = time.monotonic() + 3
-                while payload_count() and time.monotonic() < deadline:
+                while any(captured_counts()) and time.monotonic() < deadline:
                     time.sleep(0.02)
-                self.assertEqual(payload_count(), 0)
+                self.assertEqual(captured_counts(), (0, 0))
 
     def test_opt_in_expiration_disable_and_secret_filter(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -150,27 +172,29 @@ class CaptureTests(unittest.TestCase):
             key = ("Playground", "demo")
             run = RunCapture("run", "return 7;")
             run.start(path)
-            self.assertIsNone(run.sent(key, "demo.sample", {}, set()))
+            run.store.clock = store.clock
+            self.assertIsNone(run.sent(key, "demo.sample", {"input": 4}, set()))
             run.finish()
-            store.purge()
-            self.assertFalse(store.path.exists())
+            self.assertEqual(store.payloads("run", [key]), [])
+            self.assertEqual(store.sources(["run"])["run"],
+                             {"text": "return 7;", "remaining_seconds": DEFAULT_SOURCE_SECONDS})
             store.configure(key, 60)
             setting = store.setting(key)
             self.assertEqual(store.settings(), {key: 60})
             fake = "ghp_" + "x" * 36
-            store.save(key, "run", setting, {"source": fake}, set())
+            store.save(key, "run", setting, {"arguments": {"value": fake}}, set())
             store.save(key, "run", setting, {"arguments": {"value": "private"}}, {"private"})
-            store.save(key, "run", setting, {"source": "return 7;"}, set())
-            self.assertEqual(store.payloads("run", [key]), [{"source": "return 7;"}])
+            store.save(key, "run", setting, {"arguments": {"value": 7}}, set())
+            self.assertEqual(store.payloads("run", [key]), [{"arguments": {"value": 7}}])
             self.assertEqual(store.payloads("run", [("Other", "demo")]), [])
             now = 160
             self.assertEqual(store.payloads("run", [key]), [])
             store.purge()
-            with sqlite3.connect(store.path) as db:
+            with closing(sqlite3.connect(store.path)) as db:
                 self.assertEqual(db.execute("SELECT count(*) FROM payloads").fetchone(), (0,))
             store.configure(key, 0)
             store.configure(key, 30)
-            store.save(key, "run", setting, {"source": "stale opt-in"}, set())
+            store.save(key, "run", setting, {"arguments": "stale opt-in"}, set())
             self.assertEqual(store.payloads("run", [key]), [])
             run = RunCapture("fresh", "return 11;")
             run.start(path)
@@ -179,8 +203,57 @@ class CaptureTests(unittest.TestCase):
             run.completed(captured, 11)
             run.finish()
             self.assertEqual(store.payloads("fresh", [key]), [{
-                "server": key[0], "capability": "demo.sample", "source": "return 11;",
+                "server": key[0], "capability": "demo.sample",
                 "arguments": {"input": 4}, "result": 11,
             }])
             store.configure(key, 0)
             self.assertEqual(store.payloads("fresh", [key]), [])
+
+
+    def test_source_withholding_and_restrictive_server_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runs.jsonl"
+            now = 100
+            store = CaptureStore(path, clock=lambda: now)
+            first, second = ("Peer", "demo"), ("Other", "other")
+            store.configure(first, 60)
+            store.configure_source(second, 600)
+            actions = [{"capability": "demo.sample"}, {"capability": "other.sample"}]
+
+            def capture(run_id, source, secrets=()):
+                run = RunCapture(run_id, source)
+                run.routes = {"demo.sample": first, "other.sample": second}
+                run.secrets.update(secrets)
+                run.start(path)
+                run.store.clock = store.clock
+                captured = run.sent(first, "demo.sample", {"input": 4}, set())
+                run.completed(captured, 11)
+                return run.finish(actions)
+
+            fake = "ghp_" + "x" * 36
+            resolved = "private-header-value"
+            self.assertEqual(capture("shaped", f"// {fake}"), "withheld")
+            self.assertEqual(capture("resolved", f"// {resolved}", [resolved]), "withheld")
+            self.assertEqual(store.sources(["resolved", "shaped"]), {})
+            self.assertEqual(store.payloads("shaped", [first]), [])
+            source = "  const n = 11;\n  return n;"
+            self.assertIsNone(capture("retained", source))
+            self.assertEqual(store.sources(["retained"], preview=True)["retained"],
+                             {"text": "  const n = 11;", "remaining_seconds": 600})
+            self.assertEqual(store.sources(["retained"])["retained"]["text"], source)
+            store.configure_source(second, 60)
+            self.assertEqual(store.sources(["retained"])["retained"]["remaining_seconds"], 60)
+            now = 160
+            self.assertEqual(store.sources(["retained"]), {})
+            capture("remove", source)
+            store.configure(second, 60)
+            store.save(second, "legacy", store.setting(second), {"arguments": {}, "source": source}, set())
+            store.configure_source(second, 0)
+            self.assertEqual(store.payloads("legacy", [second]), [{"arguments": {}}])
+            with closing(sqlite3.connect(store.path)) as db:
+                legacy, = db.execute("SELECT data FROM payloads WHERE run = 'legacy'").fetchone()
+                self.assertNotIn("source", json.loads(legacy))
+            self.assertEqual(store.sources(["remove"]), {})
+            capture("disabled", source)
+            self.assertEqual(store.sources(["disabled"]), {})
+            self.assertTrue(store.payloads("disabled", [first]))

@@ -91,6 +91,13 @@ def percentile(values, fraction):
     return sorted(values)[math.ceil(fraction * len(values)) - 1] if values else None
 
 
+def _limit_hits(run):
+    hits = run.get("limit_hits")
+    if hits is not None:
+        return hits
+    return [run["limit_hit"]] if run.get("limit_hit") is not None else []
+
+
 def summarize(runs, history, host, now, window):
     selected = [row for row in runs if now - WINDOWS[window] < row["record"]["ended_at"] <= now]
     hour = [row for row in runs if now - 3600 < row["record"]["ended_at"] <= now]
@@ -126,21 +133,50 @@ def summarize(runs, history, host, now, window):
     current, current_refs = tally(hour)
     recent, recent_refs = tally(baseline)
     for outcome in ("FAILED", "DENIED"):
-        if (current[outcome] and sum(recent.values())
-                and current[outcome] * sum(recent.values()) > recent[outcome] * sum(current.values())):
+        if not current[outcome]:
+            continue
+        if not recent:
+            attention.append({"label": f"{outcome} actions in the last hour ({current[outcome]})",
+                              "refs": sorted(current_refs[outcome])})
+        elif current[outcome] * sum(recent.values()) > recent[outcome] * sum(current.values()):
             attention.append({
                 "label": f"{outcome} action rate above the previous 23 hours",
                 "refs": sorted(set().union(*current_refs.values(), *recent_refs.values())),
             })
 
+    def exceptional_runs(rows):
+        failures, writes, hits = [], [], defaultdict(list)
+        for row in rows:
+            run, ref = row["record"], row["ref"]
+            if run.get("outcome") == "FAILED":
+                failures.append(ref)
+            if any(action["outcome"] == "DENIED" and action.get("reason") == "WRITE_POLICY"
+                   for action in run["actions"]):
+                writes.append(ref)
+            for name in dict.fromkeys(hit["name"] for hit in _limit_hits(run)):
+                hits[name].append(ref)
+        return failures, writes, hits
+
+    failures, writes, hits = exceptional_runs(hour)
+    previous_failures, previous_writes, _ = exceptional_runs(baseline)
+    for label, refs, previous in (
+        ("Failed runs", failures, previous_failures),
+        ("Runs with writes denied", writes, previous_writes),
+    ):
+        if refs and (not baseline or len(refs) * len(baseline) > len(previous) * len(hour)):
+            comparison = [row["ref"] for row in hour + baseline] if baseline else refs
+            attention.append({"label": f"{label} in the last hour ({len(refs)})", "refs": comparison})
+    for name, refs in sorted(hits.items()):
+        attention.append({"label": f"Runs that hit {name} ({len(refs)})", "refs": refs})
+    if current["UNKNOWN"]:
+        attention.append({"label": f'UNKNOWN actions in the last hour ({current["UNKNOWN"]})',
+                          "refs": sorted(current_refs["UNKNOWN"])})
+
     capabilities = defaultdict(list)
     limits, denials = [], []
     for row in selected:
         run, ref = row["record"], row["ref"]
-        hits = run.get("limit_hits")
-        if hits is None:
-            hits = [run["limit_hit"]] if run.get("limit_hit") is not None else []
-        limits.extend({"ref": ref, **hit} for hit in hits)
+        limits.extend({"ref": ref, **hit} for hit in _limit_hits(run))
         for index, action in enumerate(run["actions"], 1):
             capability = action.get("capability")
             if capability is not None:

@@ -7,13 +7,15 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import tomllib
 import unittest
 from unittest.mock import patch
 
-from src.wyrit.capture import CaptureStore
+from src.wyrit.capture import DEFAULT_SOURCE_SECONDS, CaptureStore
 from src.wyrit.configured_host import configured_host
 from src.wyrit.console.__main__ import ConsoleServer
 from src.wyrit.host_config import load_config
@@ -206,12 +208,15 @@ class ConsoleTests(unittest.TestCase):
                     "enabled": False, "url": "https://peer.invalid/mcp"}
         self.assertEqual(self.change("save", name="remote", settings=settings)[0], 200)
         store = CaptureStore(self.directory / "runs.jsonl")
-        self.assertEqual(json.loads(self.change("capture_status")[1])["servers"][0]["seconds"], 0)
+        settings = json.loads(self.change("capture_status")[1])["servers"][0]
+        self.assertEqual((settings["seconds"], settings["source_seconds"]), (0, DEFAULT_SOURCE_SECONDS))
         self.assertFalse(store.path.exists())
         key = {"name": "remote", "namespace": "remote"}
         self.assertEqual(self.request("/api/config", {"action": "capture", "seconds": 60, **key})[0], 403)
         self.assertEqual(self.change("capture", seconds=60, **key)[0], 200)
         self.assertEqual(store.settings(), {("remote", "remote"): 60})
+        server_key = ("remote", "remote")
+        store.save_source("sample", "const a = 1;\n  return a;", {server_key}, store.source_policies())
         record = {"run_id": "sample", "started_at": 1, "ended_at": 2, "outcome": "SUCCESS", "actions": []}
         with open_ledger(self.directory / "runs.jsonl") as ledger:
             append_record(ledger, record)
@@ -219,11 +224,64 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual(status, 200)
         data = json.loads(response)
         self.assertEqual(data["feed"][0]["ref"], "r1")
+        self.assertEqual(data["previews"]["r1"]["text"], "const a = 1;")
         query = f'ref=r1&epoch={data["epoch"]}'
         self.assertEqual(json.loads(self.request(f"/api/source?{query}")[1])["record"], record)
-        self.assertEqual(json.loads(self.request(f"/api/captures?{query}")[1])["payloads"], [])
+        captures = json.loads(self.request(f"/api/captures?{query}")[1])
+        self.assertEqual(captures["source"]["text"], "const a = 1;\n  return a;")
+        self.assertEqual(captures["payloads"], [])
+        self.assertEqual(self.change("capture_source", seconds=0, **key)[0], 200)
+        updated = json.loads(self.request(
+            f'/api/monitor?epoch={data["epoch"]}&after=1&start=0&source_revision={data["source_revision"]}'
+        )[1])
+        self.assertEqual(updated["feed"], [])
+        self.assertEqual(updated["previews"], {})
+        self.assertNotEqual(updated["source_revision"], data["source_revision"])
+        self.assertIsNone(json.loads(self.request(f"/api/captures?{query}")[1])["source"])
         self.assertEqual(self.change("capture", seconds=0, **key)[0], 200)
         self.assertEqual(store.settings(), {})
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for the feed rendering test")
+    def test_run_row_is_collapsed_and_shows_first_source_line(self):
+        asset = Path(__file__).resolve().parents[1] / "src/wyrit/console/assets/console.js"
+        script = r"""
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const vm = require("node:vm");
+class Element {
+  constructor(tag) { this.tag = tag; this.dataset = {}; this.children = []; if (tag === "details") this.open = false; }
+  append(...children) { this.children.push(...children); }
+  setAttribute() {}
+  addEventListener() {}
+}
+const document = {
+  createElement: tag => new Element(tag),
+  createTextNode: text => text,
+  getElementById: () => null,
+};
+const context = vm.createContext({document, URLSearchParams, setTimeout() {}, clearTimeout() {}});
+const code = fs.readFileSync(process.argv[2], "utf8");
+const node = code.slice(code.indexOf("function node("), code.indexOf("function button("));
+const monitoring = code.slice(code.indexOf("let monitorEpoch"), code.indexOf("function renderMonitoring("));
+vm.runInContext(node + monitoring + 'function table() { return document.createElement("table"); }', context);
+const row = vm.runInContext(`
+  runCard({ref: "r1", record: {
+    run_id: "abcdef0123456789", started_at: 1, ended_at: 2, outcome: "SUCCESS",
+    actions: [{capability: "peer.sample_tool", outcome: "SUCCEEDED"}],
+  }}, {text: "  const a = 1;", remaining_seconds: 60})
+`, context);
+assert.equal(row.tag, "details");
+assert.equal(row.open, false);
+const [summary] = row.children;
+assert.equal(summary.tag, "summary");
+const [fields] = summary.children;
+assert.equal(fields.children[2].textContent, "sample_tool");
+assert.equal(fields.children[4].textContent, "abcdef01");
+assert.equal(fields.children[5].textContent, "  const a = 1;");
+assert.equal(fields.children[1].children[1].textContent, "SUCCESS");
+"""
+        subprocess.run(["node", "-", str(asset)], input=script,
+                       text=True, check=True, capture_output=True)
 
     def test_disabled_server_can_show_missing_header(self):
         settings = {

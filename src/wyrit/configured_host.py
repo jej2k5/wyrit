@@ -423,6 +423,13 @@ class ConfiguredHost:
             routes = self._routes()
             budgets, ledger_path = self._budgets, self._ledger_path
             secrets = self._secrets
+            if capture_run is not None:
+                capture_run.routes = {
+                    name: (slot.config.name, slot.config.namespace)
+                    for name, (_, slot, _, _) in routes.items()
+                }
+                capture_run.secrets.update(secrets)
+                capture_run.current_secrets = lambda: self._secrets
 
         def dispatch(capability_id, args, *, deadline, on_send=None):
             if capability_id not in routes:

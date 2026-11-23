@@ -1,6 +1,7 @@
 """Run the threaded console on the IPv4 loopback interface."""
 
 import argparse
+from hashlib import sha256
 from hmac import compare_digest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
@@ -11,7 +12,7 @@ import secrets
 from sqlite3 import Error as StorageError
 from urllib.parse import parse_qs
 
-from ..capture import CaptureStore, contains_credential
+from ..capture import DEFAULT_SOURCE_SECONDS, CaptureStore, contains_credential
 from ..configured_host import configured_host
 from ..host_config import ConfigError, load_config
 from ..mcp_adapter import _contains_secret
@@ -146,7 +147,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             if not ref.startswith("r"):
                 raise ConfigError("Choose a run to view its captured payloads.")
             servers = self.server.capture_servers()
-            return {"payloads": store.payloads(record["record"]["run_id"], servers)}
+            run_id = record["record"]["run_id"]
+            return {"payloads": store.payloads(run_id, servers), "source": store.sources([run_id]).get(run_id)}
         window, = query.get("window", ["hour"])
         cursor, = query.get("after", ["0"])
         epoch, = query.get("epoch", [""])
@@ -154,6 +156,22 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             raise ConfigError("Choose an hour, day or week window.")
         snapshot = monitor.snapshot(host.monitor_id, window, int(cursor), epoch,
                                     paused=query.get("paused") == ["1"])
+        policies = sorted(store.source_policies().items())
+        payload_policies = sorted(store.policies().items())
+        revision = sha256(repr((policies, payload_policies)).encode()).hexdigest()
+        start, = query.get("start", ["0"])
+        if epoch == monitor.epoch and query.get("source_revision") != [revision]:
+            rows = monitor.runs.rows[int(start):] if 0 <= int(start) <= snapshot["cursor"] else []
+        else:
+            rows = snapshot["feed"]
+        previews = store.sources([row["record"]["run_id"] for row in rows], preview=True)
+        snapshot["previews"] = {row["ref"]: previews[row["record"]["run_id"]]
+                                for row in rows if row["record"]["run_id"] in previews}
+        snapshot["source_revision"] = revision
+        snapshot["capture_enabled"] = {
+            "source_overrides": sum(seconds != DEFAULT_SOURCE_SECONDS for _, (seconds, _) in policies),
+            "payload_servers": len(payload_policies),
+        }
         snapshot["health_record_error"] = host.health_record_error
         return snapshot
 
@@ -181,15 +199,21 @@ class ConsoleHandler(BaseHTTPRequestHandler):
     def apply(self, request):
         if request.get("action") == "capture_status":
             servers = self.server.capture_servers()
-            settings = CaptureStore(self.server.configuration.host.ledger_path).settings()
-            return {"servers": [{"name": key[0], "namespace": key[1], "seconds": settings.get(key, 0)}
+            store = CaptureStore(self.server.configuration.host.ledger_path)
+            settings = store.settings()
+            sources = store.source_policies()
+            return {"servers": [{"name": key[0], "namespace": key[1], "seconds": settings.get(key, 0),
+                                 "source_seconds": sources.get(key, (DEFAULT_SOURCE_SECONDS, None))[0]}
                                 for key in servers]}
-        if request.get("action") == "capture":
+        if request.get("action") in {"capture", "capture_source"}:
             key = request.get("name"), request.get("namespace")
             if key not in self.server.capture_servers():
                 raise ConfigError("Select a configured server.")
             store = CaptureStore(self.server.configuration.host.ledger_path)
-            store.configure(key, request.get("seconds"))
+            if request["action"] == "capture_source":
+                store.configure_source(key, request.get("seconds"))
+            else:
+                store.configure(key, request.get("seconds"))
             return {"message": "Capture settings saved."}
         return self.server.configuration.apply(request)
 

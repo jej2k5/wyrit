@@ -358,6 +358,9 @@ function limitBlock(title, name, effective, overrides) {
 
 let feedCursor = 0;
 let monitorEpoch = "";
+let sourceRevision = "";
+let feedStart = 0;
+const feedSourceUpdates = new Map();
 let monitorBusy = false;
 let monitorRepeat = false;
 let feedPaused = false;
@@ -366,7 +369,8 @@ const marks = {SUCCEEDED: ["✓", "ok"], FAILED: ["×", "error"], DENIED: ["⊘"
 
 function outcome(value) {
   const label = node("span");
-  const [glyph, style] = marks[value] ?? ["·", "muted"];
+  const runMarks = {SUCCESS: marks.SUCCEEDED, TIMED_OUT: ["◷", "warn"], CANCELLED: ["⊘", "muted"]};
+  const [glyph, style] = marks[value] ?? runMarks[value] ?? ["·", "muted"];
   const mark = node("span", glyph, "glyph " + style);
   mark.setAttribute("aria-hidden", "true");
   label.append(mark, node("span", value));
@@ -385,10 +389,10 @@ function sourceLink(ref) {
   return link;
 }
 
-function sources(refs) {
+function sources(refs, label = "Ledger sources") {
   if (!refs.length) return "—";
   const details = node("details");
-  details.append(node("summary", "Ledger sources"));
+  details.append(node("summary", label));
   details.addEventListener("toggle", () => {
     if (!details.open || details.childElementCount > 1) return;
     const list = node("div", undefined, "actions");
@@ -406,34 +410,89 @@ function timeLabel(seconds) {
   return new Date(seconds * 1000).toLocaleString();
 }
 
-function runCard(row) {
+function capabilityName(name) {
+  if (name == null) return "—";
+  const label = node("span", undefined, "capability-name");
+  name.split(/(?<=[._])/u).forEach((part, index) => {
+    if (index) label.append(node("wbr"));
+    label.append(document.createTextNode(part));
+  });
+  return label;
+}
+
+function runCard(row, preview) {
   const run = row.record;
-  const article = node("article");
+  const article = node("details", undefined, "run-row");
   article.dataset.ended = run.ended_at;
-  const title = node("h3", run.run_id);
-  article.append(title, node("p", run.outcome + " · " + timeLabel(run.ended_at) + " · " +
-    elapsed(run.ended_at - run.started_at)), sourceLink(row.ref));
+  const summary = node("summary");
+  const fields = node("span", undefined, "run-fields");
+  const sequence = run.actions.map(action => action.capability?.split(".").at(-1) ?? "—");
+  const shortNames = sequence.join(" → ");
+  const calls = node("span", shortNames || "No calls", "run-sequence");
+  calls.title = shortNames;
+  const firstLine = node("code", undefined, "source-preview");
+  fields.append(node("time", timeLabel(run.ended_at)), outcome(run.outcome), calls,
+    node("span", elapsed(run.ended_at - run.started_at)), node("span", run.run_id.slice(0, 8)), firstLine);
+  summary.append(fields);
+  const source = node("pre", undefined, "run-source");
+  const unavailable = run.source_status === "withheld" ?
+    "source withheld: looked like a credential" : "No retained source";
+  let previewExpiry;
+  let sourceExpiry;
+  function showPreview(value) {
+    clearTimeout(previewExpiry);
+    firstLine.textContent = value ? value.text : unavailable;
+    if (value) previewExpiry = setTimeout(() => showPreview(null), value.remaining_seconds * 1000);
+  }
+  showPreview(preview);
+
+  const deniedIndex = run.actions.findIndex(action => action.outcome === "DENIED");
+  const denied = run.actions[deniedIndex];
+  const deadline = (run.limit_hits ?? [run.limit_hit]).some(hit => hit?.name === "run_deadline");
+  const reason = run.reason ?? (run.outcome === "TIMED_OUT" && deadline ? "Run deadline exceeded" :
+    denied ? "Call " + (denied.call_id ?? deniedIndex + 1) + " denied" + (denied.reason === "WRITE_POLICY" ? " by write policy" : "") : null);
+  const id = node("p", undefined, "run-id");
+  id.append(document.createTextNode("Run " + run.run_id + " · Ledger "), sourceLink(row.ref));
+  article.append(summary, id);
+  if (reason) article.append(node("p", reason));
+  article.append(source);
   article.append(table(["Call", "Capability", "Outcome", "Duration", "Result size"],
     run.actions.map((action, index) => {
       const status = outcome(action.outcome);
       if (action.outcome === "UNKNOWN") status.append(node("div", "Check the downstream system.", "prose"));
-      return [action.call_id ?? index + 1, action.capability ?? "—", status,
+      return [action.call_id ?? index + 1, capabilityName(action.capability), status,
         elapsed(action.duration_seconds), action.result_size_bytes == null ? "—" : action.result_size_bytes + " B"];
     }), "No recorded calls."));
   const capture = node("details");
   const payload = node("pre");
   const url = monitorUrl("captures", {ref: row.ref});
   capture.append(node("summary", "Captured payloads"), payload);
-  capture.addEventListener("toggle", async () => {
+  let requestVersion = 0;
+  async function loadCapture() {
+    const version = ++requestVersion;
+    clearTimeout(sourceExpiry);
     payload.textContent = "";
-    if (!capture.open) return;
+    source.textContent = "";
+    if (!article.open) return;
+    source.textContent = "Loading source…";
     try {
       const data = await request(url);
-      if (capture.open) payload.textContent = data.payloads.length ?
-        JSON.stringify(data.payloads, null, 2) : "No retained payloads for this run.";
+      if (version !== requestVersion || !article.open) return;
+      source.textContent = data.source?.text ?? unavailable;
+      if (data.source) {
+        sourceExpiry = setTimeout(() => { source.textContent = unavailable; },
+          data.source.remaining_seconds * 1000);
+      }
+      payload.textContent = data.payloads.length ? JSON.stringify(data.payloads, null, 2) :
+        "No retained payloads for this run.";
     } catch (error) {
-      if (capture.open) payload.textContent = error.message;
+      if (version === requestVersion && article.open) source.textContent = error.message;
     }
+  }
+  article.addEventListener("toggle", loadCapture);
+  feedSourceUpdates.set(row.ref, value => {
+    showPreview(value);
+    if (article.open) loadCapture();
   });
   article.append(capture);
   return article;
@@ -443,7 +502,13 @@ function renderMonitoring(data, requestedPaused, force) {
   const reset = data.epoch !== monitorEpoch;
   if (reset) {
     document.getElementById("run-feed").replaceChildren();
-    feedCursor = 0;
+    feedStart = Math.max(0, data.cursor - 50);
+    feedCursor = feedStart;
+    feedSourceUpdates.clear();
+  }
+  if (sourceRevision !== data.source_revision) {
+    for (const [ref, update] of feedSourceUpdates) update(data.previews[ref]);
+    sourceRevision = data.source_revision;
   }
   monitorEpoch = data.epoch;
   if (!feedPaused && !requestedPaused) {
@@ -454,7 +519,7 @@ function renderMonitoring(data, requestedPaused, force) {
       while (existing && Number(existing.dataset.ended) > row.record.ended_at) {
         existing = existing.nextElementSibling;
       }
-      feed.insertBefore(runCard(row), existing);
+      feed.insertBefore(runCard(row, data.previews[row.ref]), existing);
     }
     if (!feed.childElementCount) feed.append(node("p", "No recorded runs.", "prose muted empty-feed"));
     feedCursor = data.cursor;
@@ -463,21 +528,29 @@ function renderMonitoring(data, requestedPaused, force) {
       document.querySelector("#health details[open], #capability-stats details[open], #server-history details[open]"))) return;
   const strip = data.health;
   const status = document.getElementById("health");
-  status.replaceChildren(
-    node("span", strip.connected + " connected to this console"),
-    node("span", strip.exposed + " exposed capabilities"),
-    sources(strip.refs),
-    node("span", strip.runs + " runs in the last hour"),
-    sources(strip.run_refs),
-  );
+  const attention = node("div", undefined, "attention");
+  attention.append(node("strong", "Needs attention"));
+  if (!strip.attention.length && !data.health_record_error) attention.append(node("span", "None"));
   for (const item of strip.attention) {
-    status.append(node("span", item.label, "warn"), sources(item.refs));
+    attention.append(sources(item.refs, item.label));
   }
-  if (data.health_record_error) status.append(node("span", "Some health records could not be written.", "warn"));
+  if (data.health_record_error) attention.append(node("span", "Some health records could not be written.", "warn"));
+  status.replaceChildren(
+    attention,
+    strip.refs.length ? sources(strip.refs, strip.connected + " connected · " +
+      strip.exposed + " exposed capabilities") : node("span", "0 connected · 0 exposed capabilities"),
+    strip.run_refs.length ? sources(strip.run_refs, strip.runs + " runs in the last hour") :
+      node("span", "0 runs in the last hour"),
+  );
+  const capture = data.capture_enabled;
+  document.getElementById("capture-summary").textContent =
+    "Generated code is on by default for 7 days. Arguments and results are off by default. " +
+    (capture.source_overrides ? capture.source_overrides + " source retention overrides. " : "") +
+    (capture.payload_servers ? "Arguments and results on for " + capture.payload_servers + " servers." : "");
   const rate = value => (value * 100).toFixed(1) + "%";
   document.getElementById("capability-stats").replaceChildren(table(
     ["Capability", "Calls", ...Object.keys(marks), "p50", "p95", "Sources"],
-    data.capabilities.map(stats => [stats.capability, stats.calls, ...Object.keys(marks)
+    data.capabilities.map(stats => [capabilityName(stats.capability), stats.calls, ...Object.keys(marks)
       .map(key => rate(stats.rates[key])), elapsed(stats.p50), elapsed(stats.p95), sources(stats.refs)]),
     "No named calls in this window."
   ));
@@ -493,9 +566,9 @@ function renderMonitoring(data, requestedPaused, force) {
             row.record.status, row.record.host, row.record.reason ?? "—", sourceLink(row.ref)]), ""));
       });
       const reconnects = node("div", String(server.reconnects.length));
-      reconnects.append(sources(server.reconnects));
+      if (server.reconnects.length) reconnects.append(sources(server.reconnects));
       const drops = node("div", String(server.drops.length));
-      drops.append(sources([...new Set(server.drops.map(drop => drop.ref))]));
+      if (server.drops.length) drops.append(sources([...new Set(server.drops.map(drop => drop.ref))]));
       return [name, history, reconnects, drops];
     }), "No recorded server history."
   ));
@@ -503,7 +576,7 @@ function renderMonitoring(data, requestedPaused, force) {
     "Limit hit", limit.name, limit.namespace ?? "Global", limit.value ?? "—", sourceLink(limit.ref),
   ]);
   const denials = data.denials.map(denial => [
-    "Write denied", denial.capability ?? "—", "Call " + denial.call, "—", sourceLink(denial.ref),
+    "Write denied", capabilityName(denial.capability), "Call " + denial.call, "—", sourceLink(denial.ref),
   ]);
   document.getElementById("policy-history").replaceChildren(table(
     ["Event", "Limit or capability", "Scope", "Limit value", "Source"],
@@ -522,6 +595,7 @@ async function refreshMonitoring(force = false) {
   try {
     const data = await request(monitorUrl("monitor", {
       window: monitorWindow.value, after: feedCursor, paused: requestedPaused ? "1" : "0",
+      start: feedStart, source_revision: sourceRevision,
     }));
     renderMonitoring(data, requestedPaused, force);
     message("", "monitor-message");
@@ -539,35 +613,44 @@ async function refreshMonitoring(force = false) {
 async function renderCaptureSettings() {
   const data = await request("/api/config", {action: "capture_status"});
   document.getElementById("capture-settings").replaceChildren(table(
-    ["Server", "Capture", "Retention in minutes", "Actions"],
+    ["Server", "Generated code", "Arguments and results"],
     data.servers.map(server => {
-      const minutes = node("input");
-      minutes.type = "number";
-      minutes.min = "1";
-      minutes.max = "10080";
-      minutes.step = "any";
-      minutes.required = true;
-      minutes.value = server.seconds ? server.seconds / 60 : 60;
-      minutes.setAttribute("aria-label", server.name + " retention in minutes");
-      const actions = node("div", undefined, "actions");
-      async function save(seconds) {
-        if (busy) return;
-        busy = true;
-        try {
-          await request("/api/config", {action: "capture", name: server.name, namespace: server.namespace, seconds});
-          await renderCaptureSettings();
-          message("Capture settings saved.");
-        } catch (error) {
-          message(error.message);
-        } finally {
-          busy = false;
+      function controls(action, seconds, defaultMinutes, label) {
+        const minutes = node("input");
+        minutes.type = "number";
+        minutes.min = "1";
+        minutes.max = "10080";
+        minutes.step = "any";
+        minutes.required = true;
+        minutes.value = seconds ? seconds / 60 : defaultMinutes;
+        minutes.setAttribute("aria-label", server.name + " " + label + " retention in minutes");
+        const actions = node("div", undefined, "actions");
+        async function save(nextSeconds) {
+          if (busy) return;
+          busy = true;
+          try {
+            await request("/api/config", {
+              action, name: server.name, namespace: server.namespace, seconds: nextSeconds,
+            });
+            await refreshMonitoring(true);
+            await renderCaptureSettings();
+            message("Capture settings saved.");
+          } catch (error) {
+            message(error.message);
+          } finally {
+            busy = false;
+          }
         }
+        const retention = node("label", seconds ? "On · retention in minutes" : "Off · retention in minutes");
+        retention.append(minutes);
+        actions.append(retention, button(seconds ? "Update retention" : "Turn on", () => {
+          if (minutes.reportValidity()) save(Math.round(60 * minutes.valueAsNumber));
+        }));
+        if (seconds) actions.append(button("Turn off and purge", () => save(0)));
+        return actions;
       }
-      actions.append(button(server.seconds ? "Update retention" : "Turn on", () => {
-        if (minutes.reportValidity()) save(Math.round(60 * minutes.valueAsNumber));
-      }));
-      if (server.seconds) actions.append(button("Turn off and purge", () => save(0)));
-      return [server.name, server.seconds ? "ON" : "Off", minutes, actions];
+      return [server.name, controls("capture_source", server.source_seconds, 10080, "source"),
+        controls("capture", server.seconds, 60, "payload")];
     }), "Add a server to configure capture."
   ));
 }

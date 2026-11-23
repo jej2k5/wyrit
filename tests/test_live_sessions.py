@@ -16,6 +16,7 @@ from anyio.from_thread import start_blocking_portal
 from mcp.shared.memory import create_connected_server_and_client_session
 
 from src.wyrit.capabilities import RunAuthorization
+from src.wyrit.capture import CaptureStore
 from src.wyrit.configured_host import configured_host
 from src.wyrit.host_config import ConfigError
 from src.wyrit.invocation import CallError, InvocationProtocol
@@ -203,18 +204,28 @@ class LiveSessionTests(unittest.TestCase):
         client = self.enterContext(portal.wrap_async_context_manager(
             create_connected_server_and_client_session(server._mcp_server)
         ))
+        fake = "ghp_" + "x" * 36
         with (
             patch("src.wyrit.runtime.shutil.which", return_value="/trusted/node"),
             patch("src.wyrit.runtime.native_command", side_effect=SandboxUnavailable("sandbox unavailable")),
         ):
             reply = portal.call(client.call_tool, "execute", {"source": "return 42;"})
+            withheld = portal.call(client.call_tool, "execute", {"source": f"// {fake}"})
+        self.assertFalse(withheld.isError)
         self.assertFalse(reply.isError)
         result = json.loads(reply.content[0].text)
         self.assertEqual(result["limits"]["servers"]["fixture"]["max_calls"],
                          {"value": 1, "source": "server"})
-        record, = read_ledger(self.directory / "second.jsonl")
+        record, suppressed = read_ledger(self.directory / "second.jsonl")
         self.assertEqual(record["run_id"], result["run_id"])
         self.assertEqual(record["outcome"], "FAILED")
+        self.assertEqual(record["reason"], "sandbox unavailable")
+        store = CaptureStore(self.directory / "second.jsonl")
+        self.assertEqual(store.sources([result["run_id"]])[result["run_id"]]["text"], "return 42;")
+        self.assertEqual(store.payloads(result["run_id"], [("fixture", "fixture")]), [])
+        self.assertEqual(suppressed["source_status"], "withheld")
+        self.assertNotIn(fake, json.dumps(suppressed))
+        self.assertEqual(store.sources([suppressed["run_id"]]), {})
         self.assertFalse(previous_path.exists())
 
     def policy_client(self, config):

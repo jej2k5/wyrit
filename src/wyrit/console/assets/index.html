@@ -74,20 +74,24 @@
           <option value="week">Last week</option>
         </select>
       </label>
-      <button id="pause-feed" type="button" aria-pressed="false">Pause feed</button>
     </div>
     <p id="monitor-message" role="status" hidden></p>
-    <h2>Live run feed</h2>
-    <div id="run-feed"></div>
     <h2>Capability activity</h2>
     <div id="capability-stats"></div>
-    <h2>Server history</h2>
-    <div id="server-history"></div>
     <h2>Limits hit and writes denied</h2>
     <div id="policy-history"></div>
-    <h2>Payload capture</h2>
-    <p class="prose">Capture stores arguments, available results and generated code for dispatched calls. It starts off for each server.</p>
-    <div id="capture-settings"></div>
+    <h2>Server history</h2>
+    <div id="server-history"></div>
+    <p id="capture-summary" class="prose"></p>
+    <details id="capture-controls">
+      <summary>Capture settings</summary>
+      <div id="capture-settings"></div>
+    </details>
+    <div class="toolbar">
+      <h2>Live run feed</h2>
+      <button id="pause-feed" type="button" aria-pressed="false">Pause feed</button>
+    </div>
+    <div id="run-feed"></div>
   </section>
 </main>
 <script nonce="@NONCE@">@SCRIPT@</script>

@@ -70,14 +70,10 @@ def create_server(registry, dispatch=None, *, allowed_capability_ids=None,
         def run():
             if capture is not None:
                 capture.start(run_ledger)
-            try:
-                return run_javascript(
-                    source, run_id=run_id, authorization=authorization, dispatch=run_dispatch,
-                    budgets=run_budgets, ledger_path=run_ledger, tracks_send=live,
-                )
-            finally:
-                if capture is not None:
-                    capture.finish()
+            return run_javascript(
+                source, run_id=run_id, authorization=authorization, dispatch=run_dispatch,
+                budgets=run_budgets, ledger_path=run_ledger, tracks_send=live, _capture=capture,
+            )
 
         result = asdict(await to_thread.run_sync(run))
         return {

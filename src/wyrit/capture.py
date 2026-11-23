@@ -37,6 +37,9 @@ def sidecar(ledger_path, suffix):
     return path.with_name(path.name + suffix)
 
 
+DEFAULT_SOURCE_SECONDS = 7 * 86400
+
+
 class CaptureStore:
     def __init__(self, ledger_path, clock=time.time):
         self.path = sidecar(ledger_path, ".capture.sqlite3")
@@ -59,6 +62,11 @@ class CaptureStore:
                         db.execute("""CREATE TABLE IF NOT EXISTS payloads (
                             id INTEGER PRIMARY KEY, server TEXT, run TEXT,
                             created REAL, expires REAL, data BLOB)""")
+                        db.execute("""CREATE TABLE IF NOT EXISTS source_settings (
+                            server TEXT PRIMARY KEY, seconds INTEGER, epoch TEXT)""")
+                        db.execute("""CREATE TABLE IF NOT EXISTS sources (
+                            run TEXT PRIMARY KEY, created REAL, expires REAL, source TEXT, servers TEXT)""")
+                        db.execute("CREATE INDEX IF NOT EXISTS sources_expiry ON sources (expires)")
                     yield db
             finally:
                 db.close()
@@ -78,6 +86,71 @@ class CaptureStore:
             else:
                 db.execute("DELETE FROM settings WHERE server = ?", (server,))
                 db.execute("DELETE FROM payloads WHERE server = ?", (server,))
+
+    def configure_source(self, server, seconds):
+        if type(seconds) is not int or not 0 <= seconds <= DEFAULT_SOURCE_SECONDS:
+            raise ValueError("Source retention must be between zero and seven days")
+        server = json.dumps(server)
+        with self._database(create=True) as db:
+            db.execute("INSERT OR REPLACE INTO source_settings VALUES (?, ?, ?)", (server, seconds, uuid4().hex))
+            scope = "WHERE EXISTS (SELECT 1 FROM json_each(sources.servers) WHERE value = ?)"
+            if seconds:
+                db.execute("UPDATE sources SET expires = min(expires, created + ?) " + scope, (seconds, server))
+            else:
+                db.execute("DELETE FROM sources " + scope, (server,))
+                db.execute("""UPDATE payloads
+                              SET data = CAST(json_remove(CAST(data AS TEXT), '$.source') AS BLOB)
+                              WHERE server = ? AND json_type(CAST(data AS TEXT), '$.source') IS NOT NULL""",
+                           (server,))
+            self._purge(db)
+
+    @staticmethod
+    def _has_sources(db):
+        return db.execute("SELECT 1 FROM sqlite_master WHERE name = 'sources' AND type = 'table'").fetchone()
+
+    def source_policies(self):
+        with self._database() as db:
+            if db is not None and self._has_sources(db):
+                return {tuple(json.loads(key)): (seconds, epoch)
+                        for key, seconds, epoch in db.execute("SELECT server, seconds, epoch FROM source_settings")}
+        return {}
+
+    def save_source(self, run, source, servers, policies):
+        default = (DEFAULT_SOURCE_SECONDS, None)
+        with self._database(create=True) as db:
+            db.execute("BEGIN IMMEDIATE")
+            retention = DEFAULT_SOURCE_SECONDS
+            for server in servers:
+                policy = db.execute("SELECT seconds, epoch FROM source_settings WHERE server = ?",
+                                    (json.dumps(server),)).fetchone() or default
+                if policy != policies.get(server, default) or not policy[0]:
+                    return
+                retention = min(retention, policy[0])
+            now = self.clock()
+            db.execute("INSERT INTO sources VALUES (?, ?, ?, ?, ?)",
+                       (run, now, now + retention, source, json.dumps(sorted(map(json.dumps, servers)))))
+
+    def sources(self, runs, *, preview=False):
+        if not runs:
+            return {}
+        now = self.clock()
+        result = {}
+        with self._database() as db:
+            if db is None or not self._has_sources(db):
+                return result
+            column = "substr(source, 1, 240)" if preview else "source"
+            for start in range(0, len(runs), 500):
+                batch = runs[start:start + 500]
+                slots = ", ".join("?" for _ in batch)
+                for run, source, expires in db.execute(
+                        f"SELECT run, {column}, expires FROM sources WHERE expires > ? AND run IN ({slots})",
+                        (now, *batch)):
+                    first_line = source.partition("\n")[0].removesuffix("\r")
+                    result[run] = {
+                        "text": first_line if preview else source,
+                        "remaining_seconds": expires - now,
+                    }
+        return result
 
     def setting(self, server):
         return self.policies().get(tuple(server))
@@ -109,7 +182,10 @@ class CaptureStore:
                            (server, run, created, expires, payload, server, epoch))
 
     def _purge(self, db):
-        db.execute("DELETE FROM payloads WHERE expires <= ?", (self.clock(),))
+        now = self.clock()
+        db.execute("DELETE FROM payloads WHERE expires <= ?", (now,))
+        if self._has_sources(db):
+            db.execute("DELETE FROM sources WHERE expires <= ?", (now,))
 
     def purge(self):
         with self._database() as db:
@@ -126,16 +202,27 @@ class CaptureStore:
                 return []
             rows = db.execute("""SELECT server, data FROM payloads WHERE run = ? AND expires > ?
                                  ORDER BY id""", (run, self.clock()))
-            return [json.loads(payload) for server, payload in rows if server in keys]
+            payloads = []
+            for server, payload in rows:
+                if server in keys:
+                    data = json.loads(payload)
+                    data.pop("source", None)
+                    if data:
+                        payloads.append(data)
+            return payloads
 
 
 class RunCapture:
-    """Buffer only opted-in calls and write after the runtime stops."""
+    """Keep source separate from opted-in call payloads."""
 
     def __init__(self, run_id, source):
         self.run_id = run_id
         self.source = source
         self.policies = {}
+        self.source_policies = {}
+        self.routes = {}
+        self.current_secrets = lambda: ()
+        self.secrets = set()
         self.pending = []
         self.lock = Lock()
 
@@ -143,20 +230,22 @@ class RunCapture:
         self.store = CaptureStore(ledger_path)
         try:
             self.policies = self.store.policies()
+            self.source_policies = self.store.source_policies()
         except (OSError, sqlite3.Error, ValueError):
             pass
 
     def sent(self, key, capability, args, secrets):
-        setting = self.policies.get(key)
-        if setting is None:
-            return None
         with self.lock:
-            if self.pending is not None:
+            if self.pending is None:
+                return None
+            self.secrets.update(secrets)
+            setting = self.policies.get(key)
+            if setting is not None:
                 data = {
                     "server": key[0], "capability": capability,
-                    "arguments": args, "source": self.source,
+                    "arguments": args,
                 }
-                self.pending.append((key, setting, data, secrets, self.store.clock()))
+                self.pending.append((key, setting, data, self.store.clock()))
                 return data
         return None
 
@@ -165,11 +254,22 @@ class RunCapture:
             if self.pending is not None:
                 captured["result"] = result
 
-    def finish(self):
+    def finish(self, actions=()):
         with self.lock:
             pending, self.pending = self.pending, None
-        for key, setting, data, secrets, created in pending:
+        secrets = self.secrets.union(self.current_secrets())
+        if _contains_secret(self.source, secrets) or contains_credential(self.source):
+            return "withheld"
+        for key, setting, data, created in pending:
             try:
                 self.store.save(key, self.run_id, setting, data, secrets, created=created)
             except (OSError, sqlite3.Error, ValueError, RecursionError):
                 pass
+        try:
+            if len(self.source.encode()) <= MESSAGE_BYTES:
+                servers = {self.routes[action["capability"]] for action in actions
+                           if action.get("capability") in self.routes}
+                self.store.save_source(self.run_id, self.source, servers, self.source_policies)
+        except (OSError, sqlite3.Error, ValueError):
+            pass
+        return None

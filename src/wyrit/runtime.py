@@ -50,7 +50,7 @@ class _RunCancelled(Exception):
 
 
 def run_javascript(source, *, run_id, authorization, timeout=None, dispatch=None,
-                   cancel_event=None, budgets=None, ledger_path=None, tracks_send=False):
+                   cancel_event=None, budgets=None, ledger_path=None, tracks_send=False, _capture=None):
     """Run an async function body once, with optional cancellation via threading.Event."""
     if not isinstance(source, str):
         raise TypeError("JavaScript source must be a string")
@@ -90,12 +90,16 @@ def run_javascript(source, *, run_id, authorization, timeout=None, dispatch=None
             unknown_calls=tuple(action.call_id for action in actions if action.status == "UNKNOWN"),
             limits=report, limit_hit=result.limit_hit or next(iter(call_timeouts), None),
         )
+        ended = time.time()
+        source_status = _capture.finish(audit) if _capture is not None else None
         try:
             append_record(ledger, {
                 "run_id": run_id,
                 "started_at": started,
-                "ended_at": time.time(),
+                "ended_at": ended,
                 "outcome": result.status,
+                "reason": result.reason,
+                **({"source_status": source_status} if source_status else {}),
                 "limit_hit": result.limit_hit,
                 "limit_hits": limit_hits,
                 "actions": audit,

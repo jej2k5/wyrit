@@ -65,9 +65,26 @@ fieldset { min-width: 0; border: 1px solid var(--line); }
 #header-rows .actions { align-self: end; }
 main a { color: var(--accent); }
 #monitor h2 { margin: 1.65rem 0 .7rem; }
-#run-feed article { margin: .75rem 0; padding: 1rem; border: 1px solid var(--line); }
-#run-feed article > p { margin: .4rem 0; }
-#run-feed article > details { margin-top: .75rem; }
+#health .attention { flex-basis: 100%; display: flex; gap: .6rem 1.2rem; flex-wrap: wrap; }
+.attention details > summary { color: var(--ink); text-decoration: underline; text-decoration-color: var(--warn); }
+#monitor .toolbar h2 { margin: 0; }
+#run-feed { border-top: 1px solid var(--line); }
+.run-row { border-bottom: 1px solid var(--line); padding: .5rem .3rem; }
+.run-row[open] { background: var(--panel); }
+.run-row > summary { white-space: nowrap; }
+.run-fields { display: inline-grid; width: calc(100% - 1.8rem); vertical-align: middle; gap: .65rem;
+  grid-template-columns: max-content 7.25rem minmax(5rem, 1fr) max-content 5rem minmax(5rem, 1.4fr); }
+.run-sequence, .source-preview { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.source-preview { white-space: pre; font: inherit; }
+.run-source { white-space: pre; overflow-x: auto; padding: .65rem; background: var(--base); }
+.run-row > details { margin-top: .65rem; }
+.capability-name { overflow-wrap: normal; word-break: normal; }
+#capability-stats th:first-child { width: 25%; }
+@media (max-width: 1000px) {
+  .run-row > summary { white-space: normal; }
+  .run-fields { grid-template-columns: max-content minmax(0, 1fr) max-content; row-gap: .2rem; }
+  .run-sequence, .source-preview { white-space: nowrap; }
+}
 #monitor .glyph { margin-right: .35rem; }
 table { width: 100%; table-layout: fixed; border-collapse: collapse; }
 td, th { text-align: left; border-bottom: 1px solid var(--line); padding: .65rem .5rem; vertical-align: top; }
