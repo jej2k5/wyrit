@@ -1,0 +1,50 @@
+name: Linux diagnostic (temporary)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '26'
+      - name: Environment
+        run: |
+          uname -a
+          node --version
+          which node
+          cat /proc/sys/vm/overcommit_memory
+          ulimit -a
+      - name: Node under data limits (no sandbox)
+        run: |
+          for limit in 268435456 536870912 1073741824 2147483648 4294967296; do
+            if prlimit --data=$limit:$limit -- "$(which node)" -e 'console.log("ok")' >/dev/null 2>&1; then
+              echo "data limit $((limit / 1048576)) MiB: starts"
+            else
+              echo "data limit $((limit / 1048576)) MiB: FAILS (exit $?)"
+            fi
+          done
+      - name: Node under the 512 MiB limit with smaller V8 reservations
+        run: |
+          for flags in "--max-old-space-size=256" "--jitless" "--max-semi-space-size=1"; do
+            if prlimit --data=536870912:536870912 -- "$(which node)" $flags -e 'console.log("ok")' >/dev/null 2>&1; then
+              echo "512 MiB with $flags: starts"
+            else
+              echo "512 MiB with $flags: FAILS"
+            fi
+          done
+      - name: Address-space limit for comparison
+        run: |
+          for limit in 536870912 4294967296; do
+            if prlimit --as=$limit:$limit -- "$(which node)" -e 'console.log("ok")' >/dev/null 2>&1; then
+              echo "address-space limit $((limit / 1048576)) MiB: starts"
+            else
+              echo "address-space limit $((limit / 1048576)) MiB: FAILS"
+            fi
+          done
