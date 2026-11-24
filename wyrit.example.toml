@@ -36,3 +36,13 @@ max_output_bytes = 16384  # Per capability response and final return value
 #
 # [servers.remote.headers]
 # Authorization = { env = "MCP_API_TOKEN", prefix = "Bearer " }
+
+# Optional MCPxy pairing over Streamable HTTP. Replace the host and upstream slug.
+# [servers.mcpxy]
+# namespace = "github"
+# transport = "http"
+# url = "https://proxy.example.com/mcp/github"
+# expose = ["list_issues"]
+#
+# [servers.mcpxy.headers]
+# Authorization = { env = "MCPXY_PROXY_TOKEN", prefix = "Bearer " }

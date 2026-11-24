@@ -1,0 +1,15 @@
+# Phase 20 handoff
+
+MCPxy is an optional downstream server using Wyrit's existing Streamable HTTP transport. The shared MCP adapter maps JSON-RPC `-32003` with the exact message `policy_blocked:write_denied` to `DENIED` with reason `WRITE_POLICY`. The denial remains a dispatched action because the host sent the request. Other RPC errors retain `OUTCOME_UNKNOWN`. See the [quickstart](QUICKSTART.md) for both setups.
+
+## Operator check with a running MCPxy instance
+
+Status is pending. The local test uses a fake downstream and no live MCPxy endpoint and proxy credential were supplied.
+
+1. Use a test GitHub repository with a known issue. Configure a GitHub upstream in MCPxy, enable traffic logging, and use a dedicated proxy credential so the log can identify Wyrit's requests. Keep the MCPxy write policy set to deny. Give the upstream GitHub credential read-only access so the verification cannot create or edit issues if the proxy policy is misconfigured.
+2. Configure Wyrit with the HTTPS URL ending in `/mcp/<upstream>` and the environment-backed Authorization header from the quickstart. Set `ledger_path = "runs.jsonl"` at the top of the test configuration to make the run ledger easy to locate. Start the console and MCP process from an environment supplied with the proxy credential. Confirm discovery succeeds.
+3. Read the same issue from the test repository through MCPxy directly and through Wyrit. Use each client's discovery results for the tool name and arguments. Through Wyrit, call `search` for the capability schema and use `execute` with `return await tools.call(...)`. Confirm the issue number and title in both results. In MCPxy's traffic log, identify the Wyrit call by the dedicated proxy credential's identity, the upstream slug, tool, and timestamp. Record these fields without saving header values.
+4. Choose a write tool that MCPxy still advertises under its deny policy. Expose the tool temporarily in the test Wyrit config, set its classification to `write`, and allow only this tool through Wyrit's local write gate by setting `deny_writes = false` in `[servers.mcpxy.capabilities.<tool_name>]`. Keep MCPxy's deny policy in force. Restart the Wyrit MCP process, issue one schema-valid call against the test repository, and catch the JavaScript error. Verify `error.code === "DENIED"` and `error.reason === "WRITE_POLICY"`. Correlate the dispatched `DENIED` action in Wyrit with the policy block in MCPxy's log. Verify the test repository is unchanged. Remove the temporary exposure and override.
+5. Run `return typeof process;` in the guest and verify the value is `"undefined"`. Inspect the search output, run result, and ledger for the proxy credential using a trusted host-side check that reads the secret from the environment and reports only pass or fail. Keep the credential out of guest source and operator evidence.
+
+Record the MCPxy version, upstream slug, Wyrit run IDs, matching redacted traffic log entries, and pass or fail for the read, denied write, and credential checks. If the write tool is hidden from discovery, the downstream denial check remains pending until an advertised, denied write is available.

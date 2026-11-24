@@ -9,6 +9,7 @@ from anyio import fail_after
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 from mcp import types
+from mcp.shared.exceptions import McpError
 from referencing import Registry
 from referencing.exceptions import Unresolvable
 
@@ -221,6 +222,11 @@ class MCPAdapter:
             raise
         except TimeoutError:
             raise CallError("CALL_TIMEOUT") from None
+        except McpError as error:
+            # Match the explicit refusal, since server error codes can be reused.
+            if error.error.code == -32003 and error.error.message == "policy_blocked:write_denied":
+                raise CallError("DENIED", action_status="DENIED", audit_reason="WRITE_POLICY") from None
+            raise CallError("OUTCOME_UNKNOWN") from None
         except Exception:
             # The server may have acted even if the session reports an error.
             raise CallError("OUTCOME_UNKNOWN") from None
