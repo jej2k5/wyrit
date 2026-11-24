@@ -1,4 +1,4 @@
-# Phase 15: Linux verification
+# Phase 18: Linux verification
 
 Make the Bubblewrap backend verifiable on a real Linux host. Add `scripts/verify-linux.sh` that checks prerequisites (bwrap present, unprivileged user namespaces allowed), runs `WYRIT_REQUIRE_NATIVE_SANDBOX=1 python3 -m unittest discover -s tests`, and prints a summary of the containment probes. Add a GitHub Actions workflow (`.github/workflows/linux-sandbox.yml`, manual trigger plus pull requests touching `src/wyrit/native_sandbox.py`) that runs it on an Ubuntu runner, with read-only permissions and no secrets.
 
