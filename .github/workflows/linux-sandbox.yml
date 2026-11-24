@@ -27,4 +27,8 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/wyrit-venv"
           "$RUNNER_TEMP/wyrit-venv/bin/python3" -m pip install .
           echo "$RUNNER_TEMP/wyrit-venv/bin" >> "$GITHUB_PATH"
+      - name: Allow Bubblewrap user namespaces (Ubuntu 24.04 AppArmor restriction)
+        run: |
+          sudo install -m 0644 examples/apparmor/wyrit-bwrap /etc/apparmor.d/wyrit-bwrap
+          sudo apparmor_parser -r /etc/apparmor.d/wyrit-bwrap
       - run: scripts/verify-linux.sh

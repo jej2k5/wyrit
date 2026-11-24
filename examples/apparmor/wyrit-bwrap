@@ -1,0 +1,19 @@
+# AppArmor profile that lets Bubblewrap create the user namespace Wyrit's Linux
+# sandbox needs on hosts that restrict unprivileged user namespaces (Ubuntu 23.10
+# and later, kernel.apparmor_restrict_unprivileged_userns=1). It grants the
+# namespace to /usr/bin/bwrap only, rather than turning the restriction off for
+# every program. Review it, then install with:
+#
+#   sudo install -m 0644 examples/apparmor/wyrit-bwrap /etc/apparmor.d/wyrit-bwrap
+#   sudo apparmor_parser -r /etc/apparmor.d/wyrit-bwrap
+#
+# Then run scripts/verify-linux.sh before setting WYRIT_ENABLE_LINUX_SANDBOX=1.
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile wyrit-bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+
+  include if exists <local/wyrit-bwrap>
+}
