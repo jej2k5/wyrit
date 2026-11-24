@@ -15,6 +15,8 @@ RUN python3 -m pip install --no-cache-dir .
 COPY bench/ bench/
 COPY tests/ tests/
 COPY scripts/verify-linux.sh scripts/verify-linux.sh
+# Tests create scratch directories under the working directory.
+RUN chown wyrit /opt/wyrit
 
 USER wyrit
 CMD ["scripts/verify-linux.sh"]

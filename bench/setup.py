@@ -1,6 +1,7 @@
 """Set up local MCP servers and reviewed fixture recipes."""
 
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -11,6 +12,15 @@ from .tasks import EMPTY_INPUT_SCHEMA, canonical
 
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def server_env():
+    """The Wyrit server's environment. MCP clients start stdio servers with a minimal
+    environment, so the trusted host's Linux sandbox opt-in is passed on explicitly."""
+    env = {"PYTHONPATH": str(ROOT / "src")}
+    if os.environ.get("WYRIT_ENABLE_LINUX_SANDBOX") == "1":
+        env["WYRIT_ENABLE_LINUX_SANDBOX"] = "1"
+    return env
 
 
 def approve_fixture_recipe(directory, task):
@@ -53,7 +63,7 @@ def mcp_config(directory, task, approach):
         servers = {"wyrit": {
             "command": sys.executable,
             "args": ["-m", "wyrit.mcp_server", "--config", str(config)],
-            "env": {"PYTHONPATH": str(ROOT / "src")},
+            "env": server_env(),
         }}
     path = directory / "mcp.json"
     config = {"mcpServers": servers}

@@ -195,7 +195,7 @@ class NativeSandboxTests(unittest.TestCase):
                         spawn: spawn.error?.code ?? "ALLOWED",
                         tcp: await connect({host: "127.0.0.1", port}),
                         ipc: await connect({path}),
-                        env: Object.keys(process.env),
+                        env: process.env,
                     }));
                 })().catch(error => { console.error(error); process.exitCode = 1; });
             """
@@ -208,7 +208,8 @@ class NativeSandboxTests(unittest.TestCase):
             outcomes = {
                 "read": observed["read"] in denied | {"ENOENT"},
                 "write": observed["write"] in denied | {"ENOENT", "EROFS"} and not output.exists(),
-                "env": observed["env"] == [],
+                # Bubblewrap re-sets PWD to the sandbox root after --clearenv; nothing else may appear.
+                "env": observed["env"] in ({}, {"PWD": "/"}),
                 "spawn": observed["spawn"] in denied,
                 "tcp": observed["tcp"] in denied,
                 "ipc": observed["ipc"] in denied | {"ENOENT"},
