@@ -1,13 +1,15 @@
 """The agent-facing MCP tools over a host-configured capability set."""
 
 import argparse
+from collections import Counter
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 import json
 import logging
 from typing import Any
 from uuid import uuid4
 
-from anyio import to_thread
+from anyio import BrokenResourceError, ClosedResourceError, create_task_group, sleep, to_thread
 from mcp.server.fastmcp import FastMCP
 
 from .capabilities import Capability, CapabilityRegistry, RunAuthorization
@@ -16,6 +18,75 @@ from .configured_host import ConfiguredHost, configured_host
 from .host_config import ConfigError, load_config
 from .invocation import CallError
 from .runtime import run_javascript
+
+
+_DESCRIPTION_BYTES = 8 * 1024
+_CATALOG_LIMIT = 60
+_EXECUTE_DESCRIPTION = (
+    "Run a JavaScript async function body. Use return to produce a JSON value.\n"
+    'Inside the script, await tools.call("capability.id", args) for a JSON result. '
+    "A rejected call throws an Error with read-only code and capability fields.\n"
+    "Codes: DENIED, TOOL_ERROR, OUTCOME_UNKNOWN, CALL_TIMEOUT, INVALID_ARGUMENTS, "
+    "RESULT_TOO_LARGE, DISPATCH_UNAVAILABLE, INVALID_RESULT.\n"
+    "DENIED also has reason WRITE_POLICY or NOT_AUTHORIZED."
+)
+_JSON_TYPES = {"array", "boolean", "integer", "null", "number", "object", "string"}
+
+
+def _schema_type(schema):
+    if schema is False:
+        return "never"
+    kind = schema.get("type") if isinstance(schema, dict) else None
+    if isinstance(kind, str) and kind in _JSON_TYPES:
+        return kind
+    if isinstance(kind, list):
+        return "|".join(sorted({item for item in kind
+                                if isinstance(item, str) and item in _JSON_TYPES})) or "any"
+    return "any"
+
+
+def _signature(schema):
+    properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
+    required = schema.get("required", []) if isinstance(schema, dict) else []
+    if isinstance(properties, dict) and isinstance(required, list):
+        required = {name for name in required if isinstance(name, str)}
+        names = properties.keys() | required
+        if names:
+            return "{" + ", ".join(
+                f"{json.dumps(name, ensure_ascii=False)}{'*' if name in required else ''}: "
+                f"{_schema_type(properties.get(name))}" for name in sorted(names)
+            ) + "}"
+    return "{}" if _schema_type(schema) == "object" else _schema_type(schema)
+
+
+def _execute_description(capabilities):
+    capabilities = sorted(capabilities, key=lambda cap: cap.id)
+    if not capabilities:
+        return _EXECUTE_DESCRIPTION + "\n\nNo capabilities are currently exposed."
+    if len(capabilities) <= _CATALOG_LIMIT:
+        description = _EXECUTE_DESCRIPTION + "\n\nCapabilities (* required):"
+        for cap in capabilities:
+            description += (
+                f"\n{cap.id} [{cap.classification}] ({_signature(cap.input_schema)}) "
+                f"— {' '.join(cap.description.split())}"
+            )
+            encoded = description.encode("utf-8", errors="replace")
+            if len(encoded) > _DESCRIPTION_BYTES:
+                break
+        else:
+            return encoded.decode("utf-8")
+
+    counts = Counter(cap.id.rpartition(".")[0] or "(unqualified)" for cap in capabilities)
+    description = _EXECUTE_DESCRIPTION + "\n\nUse search to discover capabilities. Namespace counts:"
+    overflow = "\nAdditional namespaces available through search."
+    omitted = False
+    for namespace, count in sorted(counts.items()):
+        line = f"\n{namespace}: {count}"
+        if len((description + line + overflow).encode("utf-8")) > _DESCRIPTION_BYTES:
+            omitted = True
+        else:
+            description += line
+    return description + overflow if omitted else description
 
 
 def create_server(registry, dispatch=None, *, allowed_capability_ids=None,
@@ -33,7 +104,54 @@ def create_server(registry, dispatch=None, *, allowed_capability_ids=None,
             raise CallError("DENIED", dispatched=False, audit_reason="WRITE_POLICY")
         return dispatch(capability_id, args, deadline=deadline)
 
-    server = FastMCP("wyrit")
+    @asynccontextmanager
+    async def lifespan(_server):
+        async with create_task_group() as tasks:
+            try:
+                yield {"tasks": tasks, "watching": False}
+            finally:
+                tasks.cancel_scope.cancel()
+
+    async def watch_catalog(session, previous):
+        while True:
+            await sleep(0.1)
+            current = registry.catalog(allowed)
+            if current != previous:
+                previous = current
+                try:
+                    await session.send_tool_list_changed()
+                except (BrokenResourceError, ClosedResourceError):
+                    return
+
+    class WyritMCP(FastMCP):
+        async def list_tools(self):
+            tools = await super().list_tools()
+            if live:
+                snapshot = registry.catalog(allowed)
+                try:
+                    context = self._mcp_server.request_context
+                except LookupError:
+                    pass
+                else:
+                    state = context.lifespan_context
+                    if not state["watching"]:
+                        state["watching"] = True
+                        state["tasks"].start_soon(watch_catalog, context.session, snapshot)
+                for tool in tools:
+                    if tool.name == "execute":
+                        tool.description = _execute_description(cap for cap, _ in snapshot)
+            return tools
+
+    server = WyritMCP("wyrit", lifespan=lifespan) if live else FastMCP("wyrit")
+    if live:
+        get_capabilities = server._mcp_server.get_capabilities
+
+        def advertise_changes(notification_options, experimental_capabilities):
+            capabilities = get_capabilities(notification_options, experimental_capabilities)
+            capabilities.tools.listChanged = True
+            return capabilities
+
+        server._mcp_server.get_capabilities = advertise_changes
 
     @server.tool()
     async def search(query: str) -> dict[str, Any]:
@@ -52,7 +170,9 @@ def create_server(registry, dispatch=None, *, allowed_capability_ids=None,
             response["unavailable"] = unavailable
         return response
 
-    @server.tool()
+    @server.tool(description=_EXECUTE_DESCRIPTION if live else _execute_description(
+        visible.resolve(name) for name in visible.ids
+    ))
     async def execute(source: str) -> dict[str, Any]:
         """Run a JavaScript async function body. Use return to produce a JSON value."""
         run_id = uuid4().hex

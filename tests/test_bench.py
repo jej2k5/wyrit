@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 from mcp import ClientSession, types
 
 from bench.__main__ import ROOT, main
-from bench.agent import create_server, run_agent
+from bench.agent import check_answer, create_server, run_agent
 from bench.clients import github_snapshot
 from bench.tasks import check, github_fixture, load_tasks
 from native_support import require_native
@@ -39,6 +39,18 @@ def answer(value, *, input_tokens=19):
 
 
 class BenchTests(unittest.TestCase):
+    def test_answer_checker_accepts_only_json_or_a_standalone_fence(self):
+        task = TASKS["failure-and-denial"]
+        value = json.dumps(task["expected"])
+        for response in (value, f"```json\n{value}\n```", f"\n```\r\n{value}\r\n```\n"):
+            with patch("bench.agent.check", return_value=True) as check_value:
+                self.assertTrue(check_answer(task, response, [], []))
+                check_value.assert_called_once_with(task, task["expected"], [], [])
+        for response in (f"Answer:\n```json\n{value}\n```",
+                         f"```\n{value}\n```\nDone", f"{value}\nDone",
+                         f"```\n{value}\n```\n```\n{value}\n```"):
+            self.assertFalse(check_answer(task, response, [], []))
+
     def test_direct_dependent_chain_and_usage(self):
         task = TASKS["dependent-chain"]
 

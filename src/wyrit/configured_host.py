@@ -383,6 +383,21 @@ class ConfiguredHost:
         with self._lock:
             return CapabilityRegistry(route[0] for route in self._routes().values())
 
+    def catalog(self, allowed):
+        """Snapshot the agent-visible descriptors and effective write policy."""
+        with self._lock:
+            catalog = []
+            for key, (capability, slot, _, _) in sorted(self._routes().items()):
+                if allowed is not None and key not in allowed:
+                    continue
+                denied = False
+                if capability.classification == "write":
+                    name = capability.adapter_metadata["tool_name"]
+                    policy = slot.config.capabilities.get(name, {})
+                    denied = policy.get("deny_writes", slot.config.deny_writes)
+                catalog.append((capability, denied))
+            return tuple(catalog)
+
     @property
     def ids(self):
         with self._lock:

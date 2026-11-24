@@ -37,6 +37,7 @@ async function main() {
         const arrayPrototype = Array.prototype;
         const ownKeys = Reflect.ownKeys;
         const descriptor = Object.getOwnPropertyDescriptor;
+        const defineProperty = Object.defineProperty;
         const toString = String;
         const PromiseType = Promise;
         const ErrorType = Error;
@@ -56,6 +57,17 @@ async function main() {
         let final;
         let fatal;
         const tooLarge = new ErrorType();
+
+        function callError(code, capability, reason, message = callErrors[code]) {
+            const error = new ErrorType(message);
+            delete error.stack;
+            defineProperty(error, "code", { __proto__: null, value: code });
+            defineProperty(error, "capability", { __proto__: null, value: capability });
+            if (reason !== undefined) {
+                defineProperty(error, "reason", { __proto__: null, value: reason });
+            }
+            return error;
+        }
 
         function serialize(value) {
             let budget = limit;
@@ -115,7 +127,8 @@ async function main() {
 
         const tools = Object.freeze({ async call(capability, args) {
             if (final || fatal || pending || typeof capability !== "string") {
-                throw new ErrorType("Invalid or concurrent capability call");
+                throw callError("INVALID_ARGUMENTS", typeof capability === "string" ? capability : undefined,
+                    undefined, "Invalid or concurrent capability call");
             }
             const nextId = callId + 1;
             let wire;
@@ -124,14 +137,16 @@ async function main() {
                     __proto__: null, version, run_id, type: "call", call_id: nextId, capability, args,
                 });
             } catch (error) {
-                if (error === tooLarge) throw new ErrorType("Capability arguments too large");
-                throw error;
+                throw callError("INVALID_ARGUMENTS", capability, undefined,
+                    error === tooLarge ? "Capability arguments too large" : "");
             }
             // Proxy traps can reenter tools.call during snapshotting.
-            if (final || fatal || pending) throw new ErrorType("Concurrent capability call");
+            if (final || fatal || pending) {
+                throw callError("INVALID_ARGUMENTS", capability, undefined, "Concurrent capability call");
+            }
             callId = nextId;
             return new PromiseType((resolve, reject) => {
-                pending = { __proto__: null, wire, resolve, reject };
+                pending = { __proto__: null, wire, resolve, reject, capability };
             });
         } });
         Object.defineProperty(globalThis, "tools", { value: tools });
@@ -160,7 +175,7 @@ async function main() {
             },
             reply(raw) {
                 const reply = decode(raw);
-                if (reply === null || typeof reply !== "object" || ownKeys(reply).length !== 5 ||
+                if (reply === null || typeof reply !== "object" ||
                     !owns(reply, "version") || reply.version !== version ||
                     !owns(reply, "run_id") || reply.run_id !== run_id ||
                     !owns(reply, "call_id") || reply.call_id !== callId || !owns(reply, "type")) {
@@ -168,11 +183,17 @@ async function main() {
                 }
                 const current = pending;
                 pending = undefined;
-                if (reply.type === "call_result" && owns(reply, "result")) {
+                const fields = ownKeys(reply).length;
+                if (fields === 5 && reply.type === "call_result" && owns(reply, "result")) {
                     current.resolve(reply.result);
                 } else if (reply.type === "call_error" && owns(reply, "code") &&
                     typeof reply.code === "string" && owns(callErrors, reply.code)) {
-                    current.reject(new ErrorType(callErrors[reply.code]));
+                    const denied = reply.code === "DENIED";
+                    if (denied ? fields !== 6 || !owns(reply, "reason") ||
+                        (reply.reason !== "WRITE_POLICY" && reply.reason !== "NOT_AUTHORIZED") : fields !== 5) {
+                        throw new ErrorType("Invalid capability response");
+                    }
+                    current.reject(callError(reply.code, current.capability, denied ? reply.reason : undefined));
                 } else {
                     throw new ErrorType("Invalid capability response");
                 }

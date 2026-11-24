@@ -125,7 +125,8 @@ class InvocationProtocol:
                 raise ValueError("Invalid call ID")
             self.next_call_id += 1
             if not allowed or (capability != ECHO_CAPABILITY and self.dispatch is None):
-                return self.envelope("call_error", call_id=call_id, code="DENIED")
+                return self.envelope("call_error", call_id=call_id, code="DENIED",
+                                     reason="NOT_AUTHORIZED")
 
             if capability == ECHO_CAPABILITY:
                 result = message["args"]
@@ -155,7 +156,10 @@ class InvocationProtocol:
                         self._check_output(size, limits["max_output_bytes"], namespace)
                         if size > MESSAGE_BYTES:
                             raise self._wire_output_limit() from None
-                    return self.envelope("call_error", call_id=call_id, code=error.code)
+                    fields = {"code": error.code}
+                    if error.code == "DENIED":
+                        fields["reason"] = "WRITE_POLICY" if reason == "WRITE_POLICY" else "NOT_AUTHORIZED"
+                    return self.envelope("call_error", call_id=call_id, **fields)
                 self._actions[call_id] = replace(action, status="SUCCEEDED")
             outcome = "SUCCEEDED"
             if self.admit_call is not None:

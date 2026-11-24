@@ -4,6 +4,7 @@ from contextlib import ExitStack
 from datetime import timedelta
 import json
 from pathlib import Path
+import re
 from tempfile import TemporaryDirectory
 from time import monotonic
 
@@ -22,7 +23,7 @@ JSON_INSTRUCTION = "\nReturn only the requested JSON value."
 SYSTEM = {
     "direct": "Use the supplied MCP tools to complete the task.",
     "wyrit": (
-        "Use search to discover capabilities and execute to run JavaScript. "
+        "Use execute's capability catalog or call search if you need more detail. "
         "In execute, use await tools.call with the discovered ID and an arguments object. "
         "Source is an async function body. Use return for a JSON result. "
         "Catch individual tool errors if you need to continue after a failure."
@@ -167,6 +168,11 @@ def _run_agent(task, approach, model, settings):
 
 def check_answer(task, answer, requests, outcomes):
     try:
+        if isinstance(answer, str):
+            fence = re.fullmatch(r"```(?:json)?[ \t]*\r?\n(.*?)\r?\n[ \t]*```",
+                                 answer.strip(), re.DOTALL)
+            if fence:
+                answer = fence[1]
         return check(task, json.loads(answer), requests, outcomes)
     except (TypeError, ValueError, RecursionError):
         return False

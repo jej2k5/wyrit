@@ -8,11 +8,13 @@ import shutil
 import signal
 import sys
 import tempfile
+from threading import Event
 import time
 import unittest
 from unittest.mock import patch
 
 from anyio.from_thread import start_blocking_portal
+from mcp import types
 from mcp.shared.memory import create_connected_server_and_client_session
 
 from src.wyrit.capabilities import RunAuthorization
@@ -105,6 +107,42 @@ class LiveSessionTests(unittest.TestCase):
                 return result
             time.sleep(0.02)
         self.fail("Timed out waiting for downstream session state")
+
+    def test_execute_catalog_changes_are_advertised_to_the_client(self):
+        fixture = self.server("fixture") + "deny_writes = false\n"
+        host = self.enterContext(configured_host(self.write_config(fixture)))
+        portal = self.enterContext(start_blocking_portal())
+        changed = Event()
+
+        async def incoming(message):
+            if isinstance(message, types.ServerNotification) and isinstance(
+                message.root, types.ToolListChangedNotification
+            ):
+                changed.set()
+
+        server = create_server(host)
+        self.assertTrue(server._mcp_server.create_initialization_options().capabilities.tools.listChanged)
+        client = self.enterContext(portal.wrap_async_context_manager(
+            create_connected_server_and_client_session(server._mcp_server, message_handler=incoming)
+        ))
+
+        def description():
+            return next(tool.description for tool in portal.call(client.list_tools).tools
+                        if tool.name == "execute")
+
+        self.assertIn("fixture.original [read]", description())
+        host.dispatch("fixture.change", {}, deadline=time.monotonic() + 3)
+        self.assertTrue(changed.wait(5))
+        updated = description()
+        self.assertIn("fixture.updated [read]", updated)
+        self.assertNotIn("fixture.original", updated)
+
+        changed.clear()
+        narrowed = self.server("fixture").replace('expose = "all"', 'expose = ["original"]')
+        host.reload(self.write_config(narrowed))
+        self.assertTrue(changed.wait(5))
+        self.assertIn("fixture.original [read]", description())
+        self.assertNotIn("fixture.change", description())
 
     def test_drop_marks_action_unknown_and_reconnects_existing_mcp_server(self):
         host = self.enterContext(configured_host(self.write_config(

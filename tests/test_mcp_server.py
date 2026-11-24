@@ -15,11 +15,79 @@ from test_mcp_adapter import session_for_fixture
 from src.wyrit.budgets import RunBudgets
 from src.wyrit.capabilities import Capability, CapabilityRegistry
 from src.wyrit.mcp_adapter import MCPAdapter
-from src.wyrit.mcp_server import create_server
+from src.wyrit.mcp_server import _execute_description, create_server
+from src.wyrit.invocation import CallError
 from src.wyrit.native_sandbox import SandboxUnavailable
 
 
 class MCPServerTests(unittest.TestCase):
+    def test_execute_description_is_deterministic_and_bounded(self):
+        schema = {"type": "object", "properties": {
+            "z": {"type": ["string", "null"]}, "a": {"type": "integer"},
+        }, "required": ["a"]}
+        caps = [Capability(f"demo.group.tool-{i}", "Line one\nline two", schema, {},
+                           classification="read") for i in range(60)]
+        description = _execute_description(caps)
+        self.assertEqual(description, _execute_description(reversed(caps)))
+        self.assertIn('demo.group.tool-0 [read] ({"a"*: integer, "z": null|string}) — Line one line two',
+                      description)
+        self.assertEqual(description.count("[read]"), 60)
+        overflow = _execute_description([*caps, Capability("other.tool", "Another", {}, {})])
+        self.assertIn("demo.group: 60\nother: 1", overflow)
+        self.assertNotIn("demo.group.tool-0", overflow)
+        overflow = _execute_description([Capability("demo.long", "é" * 4100, {}, {})])
+        self.assertIn("demo: 1", overflow)
+        many_namespaces = [Capability(f"ns-{i}-" + "x" * 200 + ".tool", "Tool", {}, {})
+                           for i in range(61)]
+        self.assertLessEqual(len(_execute_description(many_namespaces).encode()), 8192)
+
+    def test_script_distinguishes_safe_read_only_call_error_fields(self):
+        require_native(self)
+        canary = "ghp_" + "x" * 36
+        downstream = f"{canary} /private/downstream.py stack: downstream"
+        caps = [Capability(f"demo.{name}", name, {}, {}, classification=classification)
+                for name, classification in (("write", "write"), ("unknown", "read"), ("failed", "read"))]
+
+        def dispatch(capability, args, *, deadline):
+            code = "OUTCOME_UNKNOWN" if capability == "demo.unknown" else "TOOL_ERROR"
+            error = CallError(code)
+            error.args = (downstream,)
+            raise error
+
+        self.connect(CapabilityRegistry(caps), dispatch, [cap.id for cap in caps])
+        result = self.tool("execute", source="""
+            const errors = [];
+            for (const id of ["demo.write", "demo.unknown", "demo.failed", "demo.hidden"]) {
+                try { await tools.call(id, {}); }
+                catch (error) {
+                    errors.push({
+                        isError: error instanceof Error, code: error.code, capability: error.capability,
+                        reason: error.reason ?? null, message: error.message,
+                        writable: Object.getOwnPropertyDescriptor(error, "code").writable,
+                        configurable: Object.getOwnPropertyDescriptor(error, "code").configurable,
+                        stack: error.stack ?? null,
+                    });
+                }
+            }
+            return errors;
+        """)
+        self.assertEqual(result["status"], "SUCCESS")
+        self.assertEqual(
+            [(row["code"], row["capability"], row["reason"], row["message"]) for row in result["value"]],
+            [
+                ("DENIED", "demo.write", "WRITE_POLICY", "Capability call denied"),
+                ("OUTCOME_UNKNOWN", "demo.unknown", None, "Capability outcome unknown"),
+                ("TOOL_ERROR", "demo.failed", None, "Capability tool reported an error"),
+                ("DENIED", "demo.hidden", "NOT_AUTHORIZED", "Capability call denied"),
+            ],
+        )
+        for row in result["value"]:
+            self.assertTrue(row["isError"])
+            self.assertFalse(row["writable"] or row["configurable"])
+            self.assertIsNone(row["stack"])
+        self.assertNotIn(canary, json.dumps(result))
+        self.assertNotIn("/private/downstream.py", json.dumps(result))
+
     def connect(self, registry, dispatch, allowed):
         portal = self.enterContext(start_blocking_portal())
         directory = self.enterContext(TemporaryDirectory(dir=os.getcwd()))
