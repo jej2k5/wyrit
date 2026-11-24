@@ -1,6 +1,7 @@
 # Copy to wyrit.toml and uncomment the servers you trust.
 # ledger_path = "runs.jsonl"
-# Relative ledger paths are resolved against this file.
+# Relative paths are resolved against this file.
+# recipes_path = "recipes"
 [limits]
 run_deadline = 10.0       # Seconds, including runtime startup
 call_timeout = 5.0        # Seconds per capability call

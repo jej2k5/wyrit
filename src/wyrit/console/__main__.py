@@ -1,7 +1,9 @@
 """Run the threaded console on the IPv4 loopback interface."""
 
 import argparse
+from collections import defaultdict
 from hashlib import sha256
+from math import ceil
 from hmac import compare_digest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
@@ -15,13 +17,14 @@ from urllib.parse import parse_qs
 from ..capture import DEFAULT_SOURCE_SECONDS, CaptureStore, contains_credential
 from ..configured_host import configured_host
 from ..host_config import ConfigError, load_config
+from ..ledger import read_ledger
 from ..mcp_adapter import _contains_secret
 from .configuration import Configuration
 from .monitoring import Monitoring, WINDOWS
 
 
 PAGES = {"/": "servers", "/servers": "servers", "/capabilities": "capabilities",
-         "/policy": "policy", "/monitor": "monitor"}
+         "/policy": "policy", "/monitor": "monitor", "/recipes": "recipes"}
 ASSETS = files(__package__).joinpath("assets")
 FONT = "/assets/jetbrains-mono-latin.woff2"
 MAX_BODY = 256 * 1024
@@ -120,6 +123,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self.reply(200, html.encode(), "text/html; charset=utf-8", nonce)
         elif self.path == FONT:
             self.reply(200, ASSETS.joinpath(FONT.rsplit("/", 1)[1]).read_bytes(), "font/woff2")
+        elif self.path == "/api/recipes":
+            self.run_configuration(self.recipe_state)
         elif self.path == "/api/state":
             self.run_configuration(self.server.configuration.state)
         else:
@@ -128,6 +133,27 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 self.run_configuration(lambda: self.monitor_request(path, parse_qs(query, max_num_fields=8)))
             else:
                 self.reply(404, {"error": "Open Servers, Capabilities, Policy and limits or Monitoring."})
+
+    def recipe_state(self):
+        host = self.server.configuration.host
+        recipes = host.recipes(details=True)
+        runs = defaultdict(list)
+        names = {recipe["name"] for recipe in recipes}
+        if names:
+            for row in read_ledger(host.ledger_path):
+                if row.get("recipe") in names:
+                    runs[row["recipe"]].append(row)
+        for recipe in recipes:
+            rows = runs[recipe["name"]]
+            durations = sorted(max(0, row["ended_at"] - row["started_at"]) for row in rows)
+            recipe["stats"] = {
+                "runs": len(rows),
+                "success_rate": sum(row["outcome"] == "SUCCESS" for row in rows) / len(rows)
+                if rows else None,
+                "p50_duration": durations[ceil(len(rows) * .5) - 1] if rows else None,
+                "p95_duration": durations[ceil(len(rows) * .95) - 1] if rows else None,
+            }
+        return {"recipes": recipes}
 
     def monitor_request(self, path, query):
         monitor = self.server.monitoring()
@@ -197,6 +223,16 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         self.run_configuration(lambda: self.apply(request))
 
     def apply(self, request):
+        action = request.get("action")
+        if action in {"approve_recipe", "revoke_recipe", "delete_recipe"}:
+            if action == "delete_recipe" and request.get("confirm") is not True:
+                raise ConfigError("Confirm the recipe deletion.")
+            configuration = self.server.configuration
+            configuration.host.change_recipe(
+                action.removesuffix("_recipe"), request.get("name"), request.get("revision"),
+                request.get("operator"), configuration.secrets,
+            )
+            return {"message": "Recipe file updated."}
         if request.get("action") == "capture_status":
             servers = self.server.capture_servers()
             store = CaptureStore(self.server.configuration.host.ledger_path)

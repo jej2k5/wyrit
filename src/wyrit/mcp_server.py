@@ -11,12 +11,15 @@ from uuid import uuid4
 
 from anyio import BrokenResourceError, ClosedResourceError, create_task_group, sleep, to_thread
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+from jsonschema.exceptions import ValidationError
 
 from .capabilities import Capability, CapabilityRegistry, RunAuthorization
 from .capture import RunCapture
 from .configured_host import ConfiguredHost, configured_host
 from .host_config import ConfigError, load_config
-from .invocation import CallError
+from .invocation import CallError, _check_value
+from .mcp_adapter import _validator
 from .runtime import run_javascript
 
 
@@ -89,6 +92,37 @@ def _execute_description(capabilities):
     return description + overflow if omitted else description
 
 
+def _brief(text, limit=256):
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _recipe_description(description, recipes):
+    if not recipes:
+        return description
+    heading = "\n\nRecipes (* required):"
+    overflow = "\nUse search to discover more recipes."
+    lines = [
+        f"\n{recipe['name']} [{_recipe_class(recipe)}] ({_brief(_signature(recipe['input_schema']))}) "
+        f"— {_brief(' '.join(recipe['description'].split()))}"
+        for recipe in recipes
+    ]
+    # Reserve space for recipe discovery even when the capability catalog is full.
+    available = min(_DESCRIPTION_BYTES * 3 // 4, _DESCRIPTION_BYTES - len((heading + overflow).encode()))
+    if len(description.encode()) > available:
+        description = description.encode()[:available].decode(errors="ignore").rsplit("\n", 1)[0]
+    description += heading
+    for line in lines:
+        if len((description + line + overflow).encode()) > _DESCRIPTION_BYTES:
+            return description + overflow
+        description += line
+    return description
+
+
+def _recipe_class(recipe):
+    return "write" if any(record["class"] == "write"
+                          for record in recipe["capabilities"].values()) else "read"
+
+
 def create_server(registry, dispatch=None, *, allowed_capability_ids=None,
                   budgets=None, ledger_path=None):
     """Build a server for one trust scope using an operator-selected allowlist."""
@@ -112,10 +146,20 @@ def create_server(registry, dispatch=None, *, allowed_capability_ids=None,
             finally:
                 tasks.cancel_scope.cancel()
 
+    def runnable_recipes():
+        return [recipe for recipe in registry.recipes(allowed) if recipe["state"] == "runnable"]
+
+    def tool_catalog():
+        catalog = registry.catalog(allowed)
+        description = _recipe_description(
+            _execute_description(cap for cap, _ in catalog), runnable_recipes(),
+        )
+        return catalog, description, registry.recipes_enabled
+
     async def watch_catalog(session, previous):
         while True:
             await sleep(0.1)
-            current = registry.catalog(allowed)
+            current = await to_thread.run_sync(tool_catalog)
             if current != previous:
                 previous = current
                 try:
@@ -127,7 +171,7 @@ def create_server(registry, dispatch=None, *, allowed_capability_ids=None,
         async def list_tools(self):
             tools = await super().list_tools()
             if live:
-                snapshot = registry.catalog(allowed)
+                snapshot = await to_thread.run_sync(tool_catalog)
                 try:
                     context = self._mcp_server.request_context
                 except LookupError:
@@ -137,9 +181,12 @@ def create_server(registry, dispatch=None, *, allowed_capability_ids=None,
                     if not state["watching"]:
                         state["watching"] = True
                         state["tasks"].start_soon(watch_catalog, context.session, snapshot)
+                _, description, recipes_enabled = snapshot
+                if not recipes_enabled:
+                    tools = [tool for tool in tools if tool.name not in {"run_recipe", "propose_recipe"}]
                 for tool in tools:
                     if tool.name == "execute":
-                        tool.description = _execute_description(cap for cap, _ in snapshot)
+                        tool.description = description
             return tools
 
     server = WyritMCP("wyrit", lifespan=lifespan) if live else FastMCP("wyrit")
@@ -166,6 +213,17 @@ def create_server(registry, dispatch=None, *, allowed_capability_ids=None,
              + ", args)"}
             for item in descriptors
         ]}
+        if live:
+            terms = query.casefold().split()
+            recipes = await to_thread.run_sync(runnable_recipes)
+            for recipe in [item for item in recipes if terms and all(
+                term in (item["name"] + " " + item["description"]).casefold() for term in terms
+            )][:5]:
+                response["matches"].append({
+                    "id": recipe["name"], "name": recipe["name"], "kind": "recipe",
+                    "description": recipe["description"], "classification": _recipe_class(recipe),
+                    "input_schema": recipe["input_schema"], "tool": "run_recipe",
+                })
         if unavailable:
             response["unavailable"] = unavailable
         return response
@@ -175,9 +233,48 @@ def create_server(registry, dispatch=None, *, allowed_capability_ids=None,
     ))
     async def execute(source: str) -> dict[str, Any]:
         """Run a JavaScript async function body. Use return to produce a JSON value."""
+        return await execute_run(source)
+
+    if live:
+        @server.tool()
+        async def propose_recipe(name: str, description: str, input_schema: dict[str, Any],
+                                 source: str) -> dict[str, Any]:
+            """Save a new pending recipe for operator review."""
+            try:
+                return await to_thread.run_sync(
+                    registry.propose_recipe, name, description, input_schema, source, allowed,
+                )
+            except ConfigError as error:
+                raise ToolError(str(error)) from None
+            except OSError:
+                raise ToolError("Could not save recipe.") from None
+
+        @server.tool()
+        async def run_recipe(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            """Run an approved recipe with validated arguments. Undeclared calls fail with RECIPE_UNDECLARED."""
+            return await execute_run("", name, arguments)
+
+    async def execute_run(source, name=None, arguments=None):
         run_id = uuid4().hex
         capture = RunCapture(run_id, source) if live else None
-        if live:
+        recipe_metadata = None
+        if name is not None:
+            try:
+                ids, run_dispatch, run_budgets, run_ledger, recipe = await to_thread.run_sync(
+                    lambda: registry.bind_run(capture_run=capture, recipe_name=name, allowed=allowed),
+                )
+            except ConfigError as error:
+                raise ToolError(str(error)) from None
+            try:
+                _check_value(arguments)
+                _validator(recipe["input_schema"]).validate(arguments)
+            except (ValidationError, ValueError, RecursionError):
+                raise ToolError("INVALID_ARGUMENTS: arguments do not match the recipe schema.") from None
+            except Exception:
+                raise ToolError("INVALID_ARGUMENTS: recipe schema could not be evaluated.") from None
+            source = recipe["source"]
+            recipe_metadata = {"recipe": name, "source_digest": recipe["approval"]["source_digest"]}
+        elif live:
             ids, run_dispatch, run_budgets, run_ledger = registry.bind_run(
                 include_settings=True, capture_run=capture,
             )
@@ -193,6 +290,7 @@ def create_server(registry, dispatch=None, *, allowed_capability_ids=None,
             return run_javascript(
                 source, run_id=run_id, authorization=authorization, dispatch=run_dispatch,
                 budgets=run_budgets, ledger_path=run_ledger, tracks_send=live, _capture=capture,
+                recipe=recipe_metadata, arguments=arguments,
             )
 
         result = asdict(await to_thread.run_sync(run))

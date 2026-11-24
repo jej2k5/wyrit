@@ -1,0 +1,27 @@
+{
+  "name": "ticket-count-and-sum",
+  "description": "Count tickets in a project and sum their points.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "project": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "project"
+    ],
+    "additionalProperties": false
+  },
+  "source": "const {ids} = await tools.call(\"tickets.list\", {project: args.project});\nlet total = 0;\nfor (const id of ids) {\n    const ticket = await tools.call(\"tickets.get\", {id});\n    total += ticket.points;\n}\nreturn {count: ids.length, total};",
+  "capabilities": {
+    "tickets.list": {
+      "schema_digest": "c269f42c6315c7273e7a63de9f22bcd26d5bd89b479c8771692d5e530ae4477f",
+      "class": "read"
+    },
+    "tickets.get": {
+      "schema_digest": "4e517600e2925e3c4c9dc63de4a4fe8a2a72d8431c4e43d773f2f3f997527af3",
+      "class": "read"
+    }
+  }
+}

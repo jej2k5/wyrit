@@ -12,5 +12,5 @@ dependencies = ["anyio>=4,<5", "jsonschema>=4.18,<5", "mcp>=1.8,<2", "referencin
 where = ["src"]
 
 [tool.setuptools.package-data]
-wyrit = ["runtime_child.cjs"]
+wyrit = ["runtime_child.cjs", "recipe_scan.cjs"]
 "wyrit.console" = ["assets/*.html", "assets/*.css", "assets/*.js", "assets/*.woff2", "assets/*.txt"]

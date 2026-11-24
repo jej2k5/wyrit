@@ -20,10 +20,11 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from .budgets import RunBudgets
 from .capabilities import CapabilityRegistry, _TOKEN
 from .capture import CaptureStore, sidecar
-from .host_config import ServerConfig, load_config, validate_config
+from .host_config import ConfigError, ServerConfig, load_config, validate_config
 from .invocation import CallError
 from .ledger import append_record, default_ledger_path, open_ledger
 from .mcp_adapter import MCPAdapter, _contains_secret
+from .recipes import Recipes
 
 
 async def _check_http_response(response):
@@ -174,6 +175,7 @@ class ConfiguredHost:
         self._budgets = RunBudgets()
         self._ledger_path = None
         self._capture_paths = set()
+        self._recipes = Recipes()
         self.monitor_id = uuid4().hex
         self.health_record_error = False
 
@@ -306,6 +308,8 @@ class ConfiguredHost:
                     new[server.name] = slot if slot and slot.config == server else _Server(server)
                 self._servers = new
                 self._secrets = config.secrets
+                if self._recipes.directory != config.recipes_path:
+                    self._recipes = Recipes(config.recipes_path)
                 self._budgets = config.budgets()
                 moved = self._ledger_path != config.ledger_path
                 for name, slot in old.items():
@@ -325,6 +329,7 @@ class ConfiguredHost:
                     ready.append(started)
             for started in ready:
                 self._portal.call(started.wait)
+            self.recipes()
 
     def inventory(self):
         with self._lock:
@@ -399,6 +404,33 @@ class ConfiguredHost:
             return tuple(catalog)
 
     @property
+    def recipes_enabled(self):
+        with self._lock:
+            return self._recipes.directory is not None
+
+    @staticmethod
+    def _recipe_capabilities(routes, allowed=None):
+        return {key: route[0] for key, route in routes.items()
+                if allowed is None or key in allowed}
+
+    def recipes(self, allowed=None, *, details=False):
+        with self._lock:
+            capabilities = self._recipe_capabilities(self._routes(), allowed)
+            return self._recipes.entries(capabilities, self._secrets, details=details)
+
+    def propose_recipe(self, name, description, input_schema, source, allowed):
+        with self._lock:
+            capabilities = self._recipe_capabilities(self._routes(), allowed)
+            return self._recipes.propose(name, description, input_schema, source,
+                                         capabilities, self._secrets)
+
+    def change_recipe(self, action, name, revision, operator, console_secrets):
+        with self._lock:
+            capabilities = self._recipe_capabilities(self._routes())
+            self._recipes.change(action, name, revision, operator, capabilities,
+                                 self._secrets | console_secrets)
+
+    @property
     def ids(self):
         with self._lock:
             return tuple(self._routes())
@@ -432,12 +464,23 @@ class ConfiguredHost:
         _, dispatch = self.bind_run()
         return dispatch(capability_id, args, deadline=deadline)
 
-    def bind_run(self, *, include_settings=False, capture_run=None):
+    def bind_run(self, *, include_settings=False, capture_run=None,
+                 recipe_name=None, allowed=None):
         """Pin a run to the capabilities and connections present at admission."""
         with self._lock:
             routes = self._routes()
             budgets, ledger_path = self._budgets, self._ledger_path
             secrets = self._secrets
+            if recipe_name is not None:
+                capabilities = self._recipe_capabilities(routes, allowed)
+                recipe = self._recipes.get(recipe_name, capabilities, secrets)
+                if recipe is None:
+                    raise ConfigError("Recipe does not exist.")
+                if recipe["state"] != "runnable":
+                    reason = recipe["reason"] or "Approval is required."
+                    raise ConfigError(f"Recipe is {recipe['state']}. {reason}")
+                if capture_run is not None:
+                    capture_run.source = recipe["source"]
             if capture_run is not None:
                 capture_run.routes = {
                     name: (slot.config.name, slot.config.namespace)
@@ -475,6 +518,8 @@ class ConfiguredHost:
                 capture_run.completed(captured, result)
             return result
 
+        if recipe_name is not None:
+            return tuple(recipe['capabilities']), dispatch, budgets, ledger_path, recipe
         if include_settings:
             return tuple(routes), dispatch, budgets, ledger_path
         return tuple(routes), dispatch

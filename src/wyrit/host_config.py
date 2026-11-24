@@ -49,6 +49,7 @@ class HostConfig:
     secrets: frozenset[str] = field(repr=False)
     limits: dict = field(default_factory=dict)
     ledger_path: Path | None = None
+    recipes_path: Path | None = None
 
     def budgets(self):
         return RunBudgets(dict(self.limits), {s.namespace: dict(s.limits) for s in self.servers})
@@ -217,10 +218,17 @@ def load_config(path) -> HostConfig:
         raise ConfigError("config: could not read the TOML file") from None
     except ValueError:
         raise ConfigError("config: invalid TOML") from None
-    _keys(data, {"servers", "limits", "ledger_path"}, "config")
+    _keys(data, {"servers", "limits", "ledger_path", "recipes_path"}, "config")
     limits = _limits(data.get("limits", {}), "config.limits")
     path_value = data.get("ledger_path")
     ledger_path = Path(path).absolute().parent / _ledger_path(path_value) if path_value is not None else None
+    recipes_value = data.get("recipes_path")
+    if recipes_value is not None and (
+        not isinstance(recipes_value, str) or not recipes_value.strip() or "\0" in recipes_value
+    ):
+        raise ConfigError("config.recipes_path: expected a directory path")
+    recipes_path = (Path(path).absolute().parent / recipes_value
+                    if recipes_value is not None else None)
     tables = data.get("servers", {})
     if not isinstance(tables, dict):
         raise ConfigError("config.servers: expected a table")
@@ -234,7 +242,7 @@ def load_config(path) -> HostConfig:
             raise ConfigError(f"servers.{name!r}.namespace: duplicate namespace")
         namespaces.add(server.namespace)
         servers.append(server)
-    return HostConfig(tuple(servers), frozenset(secrets), limits, ledger_path)
+    return HostConfig(tuple(servers), frozenset(secrets), limits, ledger_path, recipes_path)
 
 
 def validate_config(config):
@@ -248,6 +256,10 @@ def validate_config(config):
         if not isinstance(config.ledger_path, Path):
             raise ConfigError("config.ledger_path: expected a resolved path")
         _ledger_path(str(config.ledger_path))
+    if config.recipes_path is not None and (
+        not isinstance(config.recipes_path, Path) or "\0" in str(config.recipes_path)
+    ):
+        raise ConfigError("config.recipes_path: expected a resolved path")
     names = set()
     namespaces = set()
     for server in config.servers:

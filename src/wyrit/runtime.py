@@ -50,7 +50,8 @@ class _RunCancelled(Exception):
 
 
 def run_javascript(source, *, run_id, authorization, timeout=None, dispatch=None,
-                   cancel_event=None, budgets=None, ledger_path=None, tracks_send=False, _capture=None):
+                   cancel_event=None, budgets=None, ledger_path=None, tracks_send=False, _capture=None,
+                   recipe=None, arguments=None):
     """Run an async function body once, with optional cancellation via threading.Event."""
     if not isinstance(source, str):
         raise TypeError("JavaScript source must be a string")
@@ -79,7 +80,7 @@ def run_javascript(source, *, run_id, authorization, timeout=None, dispatch=None
                              ledger_error="Could not open run ledger")
         try:
             result = _run(source, run_id, authorization, dispatch, cancel_event,
-                          budgets, audit, actions, call_timeouts, tracks_send)
+                          budgets, audit, actions, call_timeouts, tracks_send, recipe, arguments)
         except Exception:
             result = RunResult("FAILED", reason="Unexpected runtime failure")
         limit_hits = [*call_timeouts]
@@ -95,6 +96,7 @@ def run_javascript(source, *, run_id, authorization, timeout=None, dispatch=None
         try:
             append_record(ledger, {
                 "run_id": run_id,
+                **(recipe or {}),
                 "started_at": started,
                 "ended_at": ended,
                 "outcome": result.status,
@@ -148,7 +150,7 @@ class _BudgetState:
 
 
 def _run(source, run_id, authorization, dispatch, cancel_event, budgets, audit, actions,
-         call_timeouts, tracks_send):
+         call_timeouts, tracks_send, recipe, arguments):
     if not isinstance(authorization, RunAuthorization) or authorization.run_id != run_id:
         return RunResult("FAILED", reason="Invalid run authorization")
     if len(source) > MESSAGE_BYTES:
@@ -248,8 +250,12 @@ def _run(source, run_id, authorization, dispatch, cancel_event, budgets, audit, 
     protocol = InvocationProtocol(
         run_id, authorization, dispatch=invoke if dispatch is not None else None,
         admit_call=budget.admit_call, audit=audit,
+        recipe=recipe is not None,
     )
-    initial = encode(protocol.envelope("start", source=source, messageBytes=MESSAGE_BYTES))
+    initial = encode(protocol.envelope(
+        "start", source=source, messageBytes=MESSAGE_BYTES,
+        **({"arguments": arguments} if recipe is not None else {}),
+    ))
     if len(initial) > MESSAGE_BYTES:
         return RunResult("FAILED", reason="Source message too large")
 

@@ -8,7 +8,7 @@ async function main() {
     const lines = input[Symbol.asyncIterator]();
     const first = await lines.next();
     if (first.done) return;
-    const { type, version, run_id, source, messageBytes } = JSON.parse(first.value);
+    const { type, version, run_id, source, messageBytes, arguments: args } = JSON.parse(first.value);
     if (type !== "start" || version !== 1 || typeof run_id !== "string" ||
         typeof source !== "string" || messageBytes !== 64 * 1024) {
         throw new Error("Invalid runtime startup message");
@@ -46,6 +46,7 @@ async function main() {
             DENIED: "Capability call denied",
             DISPATCH_UNAVAILABLE: "Capability dispatch unavailable",
             INVALID_ARGUMENTS: "Invalid capability arguments",
+            RECIPE_UNDECLARED: "Capability is not declared in the recipe",
             TOOL_ERROR: "Capability tool reported an error",
             OUTCOME_UNKNOWN: "Capability outcome unknown",
             INVALID_RESULT: "Invalid capability response",
@@ -156,9 +157,9 @@ async function main() {
             denyImport() {
                 throw new ErrorType("Module loading is disabled");
             },
-            async start(program) {
+            async start(program, rawArgs) {
                 try {
-                    const result = await apply(program, undefined, []);
+                    const result = await apply(program, undefined, rawArgs === undefined ? [] : [decode(rawArgs)]);
                     final = serialize({ __proto__: null, version, run_id, type: "result", result });
                 } catch (error) {
                     fatal = error === tooLarge ? oversized : failure;
@@ -204,11 +205,12 @@ async function main() {
     const controller = vm.runInContext("(" + bootstrap + ")(" + bootstrapArgs.join(",") + ")", context);
 
     try {
-        const program = new vm.Script('(async () => { "use strict";\n' + source + '\n})', {
+        const program = new vm.Script('(async (' + (args === undefined ? '' : 'args') + ') => { "use strict";\n' +
+            source + '\n})', {
             filename: "generated.js",
             importModuleDynamically: controller.denyImport,
         }).runInContext(context);
-        controller.start(program);
+        controller.start(program, JSON.stringify(args));
     } catch {
         process.stdout.write(failure + "\n");
         return;

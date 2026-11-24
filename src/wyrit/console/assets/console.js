@@ -1,7 +1,7 @@
 "use strict";
 
 const page = document.body.dataset.page;
-const titles = {servers: "Servers", capabilities: "Capabilities", policy: "Policy and limits", monitor: "Monitoring"};
+const titles = {servers: "Servers", capabilities: "Capabilities", policy: "Policy and limits", monitor: "Monitoring", recipes: "Recipes"};
 const token = document.querySelector('meta[name="wyrit-token"]').content;
 const editor = document.getElementById("editor");
 const theme = document.getElementById("theme");
@@ -65,6 +65,7 @@ async function request(path, payload) {
 }
 
 async function refresh() {
+  if (page === "recipes") return renderRecipes();
   if (page === "monitor") {
     await refreshMonitoring(true);
     await renderCaptureSettings();
@@ -655,6 +656,75 @@ async function renderCaptureSettings() {
   ));
 }
 
+async function renderRecipes() {
+  const {recipes} = await request("/api/recipes");
+  const panel = document.getElementById("recipes");
+  panel.replaceChildren();
+  if (!recipes.length) panel.append(node("p", "No recipes found.", "prose muted"));
+  const labels = {runnable: "Runnable", pending: "Pending", unapproved: "Unapproved", stale: "Stale"};
+  for (const [status, title] of Object.entries(labels)) {
+    const group = recipes.filter(recipe => recipe.state === status);
+    if (!group.length) continue;
+    panel.append(node("h2", title));
+    for (const recipe of group) {
+      const detail = node("details");
+      detail.append(node("summary", recipe.name));
+      if (recipe.reason) detail.append(node("p", recipe.reason));
+      if (recipe.revision) {
+        detail.append(node("p", recipe.description));
+        if (recipe.approval) {
+          detail.append(node("p", "Approval recorded by " + recipe.approval.approved_by +
+            " on " + recipe.approval.approved_at));
+        }
+        detail.append(node("h3", "Source"), node("pre", recipe.source, "run-source"));
+        detail.append(node("h3", "Argument schema"), node("pre", JSON.stringify(recipe.input_schema, null, 2)));
+        detail.append(node("h3", "Capabilities"), table(["Capability", "Recorded class", "Current class"],
+          Object.entries(recipe.capabilities).map(([id, record]) =>
+            [id, record.class, recipe.current_capabilities[id]?.class || "Unavailable"]), "No capability calls."));
+        if (recipe.diff) detail.append(node("h3", "Changes since approval"), node("pre", recipe.diff, "run-source"));
+        const {runs, success_rate, p50_duration, p95_duration} = recipe.stats;
+        if (runs) {
+          detail.append(node("p", runs + " runs · " + (success_rate * 100).toFixed(1) +
+            "% succeeded · p50 " + p50_duration.toFixed(3) + " s · p95 " + p95_duration.toFixed(3) + " s"));
+        } else {
+          detail.append(node("p", "No recorded runs."));
+        }
+        const actions = node("div", undefined, "actions");
+        const operator = node("input");
+        operator.required = true;
+        const label = node("label", "Operator label");
+        label.append(operator);
+        const update = async (action, payload = {}) => {
+          if (busy) return;
+          busy = true;
+          try {
+            const result = await request("/api/config", {
+              action, name: recipe.name, revision: recipe.revision, ...payload,
+            });
+            await renderRecipes();
+            message(result.message);
+          } catch (error) {
+            message(error.message);
+          } finally {
+            busy = false;
+          }
+        };
+        if (recipe.state !== "runnable") {
+          actions.append(label, button("Approve", () => {
+            if (operator.reportValidity()) update("approve_recipe", {operator: operator.value});
+          }, "primary"));
+        }
+        if (recipe.approval) actions.append(button("Revoke", () => update("revoke_recipe")));
+        actions.append(button("Delete", () => {
+          if (window.confirm("Delete " + recipe.name + "?")) update("delete_recipe", {confirm: true});
+        }));
+        detail.append(actions);
+      }
+      panel.append(detail);
+    }
+  }
+}
+
 document.getElementById("title").textContent = titles[page];
 document.title = titles[page] + " · Wyrit";
 document.getElementById(page).hidden = false;
@@ -686,6 +756,7 @@ document.getElementById("pause-feed").addEventListener("click", event => {
 refresh().catch(error => message(error.message));
 setInterval(async () => {
   if (page === "monitor") return refreshMonitoring();
+  if (page === "recipes") return;
   if (busy || !editor.hidden || document.hidden || document.activeElement.closest("table")) return;
   try {
     const next = await request("/api/state");

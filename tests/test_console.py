@@ -85,6 +85,51 @@ class ConsoleTests(unittest.TestCase):
         self.assertTrue(self.request("/assets/jetbrains-mono-latin.woff2")[1].startswith(b"wOF2"))
         self.assertEqual(self.request("/missing")[0], 404)
 
+    @unittest.skipUnless(shutil.which("node"), "Node.js required for recipe approval")
+    def test_recipe_review_mutations_and_ledger_stats(self):
+        self.path.write_text('recipes_path = "recipes"\nledger_path = "runs.jsonl"\n')
+        self.assertEqual(self.change("reload")[0], 200)
+        self.host.propose_recipe("review-me", "Review this script", {"type": "object"},
+                                 "return args;", None)
+        path = self.directory / "recipes" / "review-me.json"
+        original = path.read_bytes()
+
+        def entry():
+            status, response, _ = self.request("/api/recipes")
+            self.assertEqual(status, 200)
+            return json.loads(response)["recipes"][0]
+
+        page = self.request("/recipes")
+        self.assertIn(b'data-page="recipes"', page[1])
+        pending = entry()
+        self.assertEqual(pending["state"], "pending")
+        payload = dict(name="review-me", revision=pending["revision"], operator="Reviewer")
+        self.assertEqual(self.request("/api/config", {"action": "approve_recipe", **payload})[0], 403)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(self.change("approve_recipe", **payload)[0], 200)
+        approved = entry()
+        self.assertEqual(approved["state"], "runnable")
+        self.assertEqual(approved["approval"]["approved_by"], "Reviewer")
+        self.assertEqual(path.with_suffix(".json.bak").read_bytes(), original)
+        with open_ledger(self.host.ledger_path) as ledger:
+            for started, ended, outcome in [(0, 1, "SUCCESS"), (2, 5, "FAILED")]:
+                append_record(ledger, {"recipe": "review-me", "outcome": outcome,
+                                       "started_at": started, "ended_at": ended})
+        self.assertEqual(entry()["stats"], {
+            "runs": 2, "success_rate": .5, "p50_duration": 1, "p95_duration": 3,
+        })
+        payload["revision"] = approved["revision"]
+        self.assertEqual(self.request("/api/config", {"action": "revoke_recipe", **payload})[0], 403)
+        self.assertEqual(self.change("revoke_recipe", **payload)[0], 200)
+        self.assertNotIn("approval", json.loads(path.read_text()))
+        payload["revision"] = entry()["revision"]
+        self.assertEqual(self.request("/api/config", {"action": "delete_recipe", **payload,
+                                                     "confirm": True})[0], 403)
+        self.assertEqual(self.change("delete_recipe", **payload)[0], 400)
+        self.assertEqual(self.change("delete_recipe", **payload, confirm=True)[0], 200)
+        self.assertFalse(path.exists())
+        self.assertEqual(json.loads(self.request("/api/recipes")[1])["recipes"], [])
+
     def test_probe_save_exposure_policy_limits_disable_remove(self):
         fixture = self.directory / "peer.py"
         fixture.write_text(FIXTURE, encoding="utf-8")

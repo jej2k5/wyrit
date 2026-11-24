@@ -70,13 +70,15 @@ class ActionRecord:
 
 
 class InvocationProtocol:
-    def __init__(self, run_id, authorization, *, dispatch=None, deadline=None, admit_call=None, audit=None):
+    def __init__(self, run_id, authorization, *, dispatch=None, deadline=None, admit_call=None,
+                 audit=None, recipe=False):
         self.run_id = run_id
         self.authorization = authorization
         self.dispatch = dispatch
         self.deadline = deadline
         self.admit_call = admit_call
         self.audit = audit
+        self.recipe = recipe
         self.next_call_id = 1
         self._actions = {}
 
@@ -124,11 +126,15 @@ class InvocationProtocol:
             elif call_id > MAX_CALLS:
                 raise ValueError("Invalid call ID")
             self.next_call_id += 1
-            if not allowed or (capability != ECHO_CAPABILITY and self.dispatch is None):
+            if self.recipe and not allowed:
+                reason = "RECIPE_UNDECLARED"
+                return self.envelope("call_error", call_id=call_id, code=reason)
+            local_echo = capability == ECHO_CAPABILITY and not self.recipe
+            if not allowed or (not local_echo and self.dispatch is None):
                 return self.envelope("call_error", call_id=call_id, code="DENIED",
                                      reason="NOT_AUTHORIZED")
 
-            if capability == ECHO_CAPABILITY:
+            if local_echo:
                 result = message["args"]
             else:
                 action = ActionRecord(call_id, capability, "DISPATCHED")
