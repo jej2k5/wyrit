@@ -2,6 +2,7 @@
 
 from concurrent.futures import Future, wait
 from contextlib import ExitStack
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 import math
@@ -24,7 +25,8 @@ from .native_sandbox import SandboxUnavailable, native_command
 STDOUT_BYTES = 256 * 1024
 STDERR_BYTES = 8 * 1024
 CANCELLATION_POLL_SECONDS = 0.02
-_DISPATCH_SLOTS = BoundedSemaphore(8)
+_MAX_DISPATCH_THREADS = 8
+_DISPATCH_SLOTS = BoundedSemaphore(_MAX_DISPATCH_THREADS)
 
 
 @dataclass(frozen=True)
@@ -51,7 +53,8 @@ class _RunCancelled(Exception):
 
 def run_javascript(source, *, run_id, authorization, timeout=None, dispatch=None,
                    cancel_event=None, budgets=None, ledger_path=None, tracks_send=False, _capture=None,
-                   recipe=None, arguments=None):
+                   recipe=None, arguments=None, ledger_sink=None, context_id=None,
+                   local_echo=True, isolate_dispatch=False):
     """Run an async function body once, with optional cancellation via threading.Event."""
     if not isinstance(source, str):
         raise TypeError("JavaScript source must be a string")
@@ -73,14 +76,17 @@ def run_javascript(source, *, run_id, authorization, timeout=None, dispatch=None
     actions = []
     call_timeouts = []
     with ExitStack() as stack:
+        if ledger_sink is None:
+            try:
+                ledger = stack.enter_context(open_ledger(ledger_path))
+            except (OSError, RuntimeError):
+                return RunResult("FAILED", reason="Could not open run ledger", limits=report,
+                                 ledger_error="Could not open run ledger")
         try:
-            ledger = stack.enter_context(open_ledger(ledger_path))
-        except (OSError, RuntimeError):
-            return RunResult("FAILED", reason="Could not open run ledger", limits=report,
-                             ledger_error="Could not open run ledger")
-        try:
+            slots = BoundedSemaphore(_MAX_DISPATCH_THREADS) if isolate_dispatch else _DISPATCH_SLOTS
             result = _run(source, run_id, authorization, dispatch, cancel_event,
-                          budgets, audit, actions, call_timeouts, tracks_send, recipe, arguments)
+                          budgets, audit, actions, call_timeouts, tracks_send, recipe, arguments,
+                          local_echo, slots)
         except Exception:
             result = RunResult("FAILED", reason="Unexpected runtime failure")
         limit_hits = [*call_timeouts]
@@ -93,20 +99,27 @@ def run_javascript(source, *, run_id, authorization, timeout=None, dispatch=None
         )
         ended = time.time()
         source_status = _capture.finish(audit) if _capture is not None else None
+        reference = {"context_id": context_id} if context_id is not None else {}
+        record = {
+            "run_id": run_id,
+            **reference,
+            **(recipe or {}),
+            "started_at": started,
+            "ended_at": ended,
+            "outcome": result.status,
+            "reason": result.reason,
+            **({"source_status": source_status} if source_status else {}),
+            "limit_hit": result.limit_hit,
+            "limit_hits": limit_hits,
+        }
         try:
-            append_record(ledger, {
-                "run_id": run_id,
-                **(recipe or {}),
-                "started_at": started,
-                "ended_at": ended,
-                "outcome": result.status,
-                "reason": result.reason,
-                **({"source_status": source_status} if source_status else {}),
-                "limit_hit": result.limit_hit,
-                "limit_hits": limit_hits,
-                "actions": audit,
-            })
-        except OSError:
+            if ledger_sink is None:
+                append_record(ledger, {**record, "actions": [{**action, **reference} for action in audit]})
+            else:
+                ledger_sink(deepcopy({**record, "type": "run"}))
+                for action in audit:
+                    ledger_sink({**action, **reference, "type": "action", "run_id": run_id})
+        except Exception:
             return replace(result, ledger_error="Could not append run ledger")
         return result
 
@@ -150,7 +163,7 @@ class _BudgetState:
 
 
 def _run(source, run_id, authorization, dispatch, cancel_event, budgets, audit, actions,
-         call_timeouts, tracks_send, recipe, arguments):
+         call_timeouts, tracks_send, recipe, arguments, local_echo, slots):
     if not isinstance(authorization, RunAuthorization) or authorization.run_id != run_id:
         return RunResult("FAILED", reason="Invalid run authorization")
     if len(source) > MESSAGE_BYTES:
@@ -169,7 +182,6 @@ def _run(source, run_id, authorization, dispatch, cancel_event, budgets, audit, 
 
     def invoke(capability, args, *, deadline=None):
         completion = Future()
-        slots = _DISPATCH_SLOTS
         lock = Lock()
         sent = False
         closed = False
@@ -224,7 +236,7 @@ def _run(source, run_id, authorization, dispatch, cancel_event, budgets, audit, 
                     if finished <= deadline:
                         if error is None:
                             return value
-                        if error.code != "CALL_TIMEOUT":
+                        if error.code != "CALL_TIMEOUT" or error.host_reported:
                             raise error
                         if call_deadline_first:
                             raise timed_out()
@@ -250,7 +262,7 @@ def _run(source, run_id, authorization, dispatch, cancel_event, budgets, audit, 
     protocol = InvocationProtocol(
         run_id, authorization, dispatch=invoke if dispatch is not None else None,
         admit_call=budget.admit_call, audit=audit,
-        recipe=recipe is not None,
+        recipe=recipe is not None, local_echo=local_echo,
     )
     initial = encode(protocol.envelope(
         "start", source=source, messageBytes=MESSAGE_BYTES,

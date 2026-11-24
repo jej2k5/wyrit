@@ -13,6 +13,10 @@ VERSION = 1
 MESSAGE_BYTES = 64 * 1024
 MAX_CALLS = 32
 ECHO_CAPABILITY = "fake.echo"
+CALL_CODES = frozenset({
+    "DENIED", "TOOL_ERROR", "OUTCOME_UNKNOWN", "CALL_TIMEOUT", "INVALID_ARGUMENTS",
+    "RESULT_TOO_LARGE", "DISPATCH_UNAVAILABLE", "INVALID_RESULT",
+})
 
 
 def encode(value):
@@ -44,13 +48,16 @@ def _check_value(value, depth=0):
 class CallError(Exception):
     """A host adapter failure with a public, fixed protocol code."""
 
-    def __init__(self, code, *, dispatched=True, action_status=None, result_size=None, audit_reason=None):
+    def __init__(self, code, *, dispatched=True, action_status=None, result_size=None,
+                 audit_reason=None, public_reason=None, host_reported=False):
         super().__init__(code)
         self.code = code
         self.dispatched = dispatched
         self.action_status = action_status
         self.result_size = result_size
         self.audit_reason = audit_reason
+        self.public_reason = public_reason
+        self.host_reported = host_reported
         self.audit_server = None
 
 
@@ -71,7 +78,7 @@ class ActionRecord:
 
 class InvocationProtocol:
     def __init__(self, run_id, authorization, *, dispatch=None, deadline=None, admit_call=None,
-                 audit=None, recipe=False):
+                 audit=None, recipe=False, local_echo=True):
         self.run_id = run_id
         self.authorization = authorization
         self.dispatch = dispatch
@@ -79,6 +86,7 @@ class InvocationProtocol:
         self.admit_call = admit_call
         self.audit = audit
         self.recipe = recipe
+        self.local_echo = local_echo
         self.next_call_id = 1
         self._actions = {}
 
@@ -129,7 +137,7 @@ class InvocationProtocol:
             if self.recipe and not allowed:
                 reason = "RECIPE_UNDECLARED"
                 return self.envelope("call_error", call_id=call_id, code=reason)
-            local_echo = capability == ECHO_CAPABILITY and not self.recipe
+            local_echo = self.local_echo and capability == ECHO_CAPABILITY and not self.recipe
             if not allowed or (not local_echo and self.dispatch is None):
                 return self.envelope("call_error", call_id=call_id, code="DENIED",
                                      reason="NOT_AUTHORIZED")
@@ -163,9 +171,17 @@ class InvocationProtocol:
                         if size > MESSAGE_BYTES:
                             raise self._wire_output_limit() from None
                     fields = {"code": error.code}
-                    if error.code == "DENIED":
+                    if error.public_reason is not None:
+                        if self.admit_call is not None:
+                            size = len(encode(error.public_reason))
+                            self._check_output(size, limits["max_output_bytes"], namespace)
+                        fields["reason"] = error.public_reason
+                    elif error.code == "DENIED":
                         fields["reason"] = "WRITE_POLICY" if reason == "WRITE_POLICY" else "NOT_AUTHORIZED"
-                    return self.envelope("call_error", call_id=call_id, **fields)
+                    reply = self.envelope("call_error", call_id=call_id, **fields)
+                    if len(encode(reply)) > MESSAGE_BYTES:
+                        raise self._wire_output_limit()
+                    return reply
                 self._actions[call_id] = replace(action, status="SUCCEEDED")
             outcome = "SUCCEEDED"
             if self.admit_call is not None:

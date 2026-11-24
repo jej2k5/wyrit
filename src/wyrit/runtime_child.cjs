@@ -189,12 +189,12 @@ async function main() {
                     current.resolve(reply.result);
                 } else if (reply.type === "call_error" && owns(reply, "code") &&
                     typeof reply.code === "string" && owns(callErrors, reply.code)) {
-                    const denied = reply.code === "DENIED";
-                    if (denied ? fields !== 6 || !owns(reply, "reason") ||
-                        (reply.reason !== "WRITE_POLICY" && reply.reason !== "NOT_AUTHORIZED") : fields !== 5) {
+                    const hasReason = owns(reply, "reason");
+                    if (hasReason ? fields !== 6 || typeof reply.reason !== "string" :
+                        fields !== 5 || reply.code === "DENIED") {
                         throw new ErrorType("Invalid capability response");
                     }
-                    current.reject(callError(reply.code, current.capability, denied ? reply.reason : undefined));
+                    current.reject(callError(reply.code, current.capability, hasReason ? reply.reason : undefined));
                 } else {
                     throw new ErrorType("Invalid capability response");
                 }

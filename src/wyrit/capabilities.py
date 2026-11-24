@@ -40,8 +40,9 @@ class Capability:
     classification: str
     _descriptor: str
 
-    def __init__(self, id, description, input_schema, output_schema, adapter_metadata=None,
-                 *, classification="write"):
+    def __init__(self, id: str, description: str, input_schema: dict | bool,
+                 output_schema: dict | bool = True, adapter_metadata: dict | None = None,
+                 *, classification: str = "write") -> None:
         _check_id(id)
         if not isinstance(description, str) or not description.strip():
             raise ValueError("A capability requires a description")
@@ -67,21 +68,21 @@ class Capability:
         object.__setattr__(self, "_descriptor", _serialize(descriptor))
 
     @property
-    def input_schema(self):
+    def input_schema(self) -> dict | bool:
         return self.to_dict()["input_schema"]
 
     @property
-    def output_schema(self):
+    def output_schema(self) -> dict | bool:
         return self.to_dict()["output_schema"]
 
     @property
-    def adapter_metadata(self):
+    def adapter_metadata(self) -> dict:
         return self.to_dict()["adapter_metadata"]
 
-    def to_dict(self):
+    def to_dict(self) -> dict:
         return json.loads(self._descriptor)
 
-    def to_json(self):
+    def to_json(self) -> str:
         return self._descriptor
 
 

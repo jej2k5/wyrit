@@ -1,126 +1,22 @@
 """The agent-facing MCP tools over a host-configured capability set."""
 
 import argparse
-from collections import Counter
 from contextlib import asynccontextmanager
-from dataclasses import asdict
 import json
 import logging
 from typing import Any
-from uuid import uuid4
 
 from anyio import BrokenResourceError, ClosedResourceError, create_task_group, sleep, to_thread
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
-from jsonschema.exceptions import ValidationError
 
-from .capabilities import Capability, CapabilityRegistry, RunAuthorization
+from .capabilities import Capability, CapabilityRegistry
 from .capture import RunCapture
+from .catalog import _EXECUTE_DESCRIPTION, _execute_description, _recipe_class, _recipe_description
 from .configured_host import ConfiguredHost, configured_host
 from .host_config import ConfigError, load_config
-from .invocation import CallError, _check_value
-from .mcp_adapter import _validator
-from .runtime import run_javascript
-
-
-_DESCRIPTION_BYTES = 8 * 1024
-_CATALOG_LIMIT = 60
-_EXECUTE_DESCRIPTION = (
-    "Run a JavaScript async function body. Use return to produce a JSON value.\n"
-    'Inside the script, await tools.call("capability.id", args) for a JSON result. '
-    "A rejected call throws an Error with read-only code and capability fields.\n"
-    "Codes: DENIED, TOOL_ERROR, OUTCOME_UNKNOWN, CALL_TIMEOUT, INVALID_ARGUMENTS, "
-    "RESULT_TOO_LARGE, DISPATCH_UNAVAILABLE, INVALID_RESULT.\n"
-    "DENIED also has reason WRITE_POLICY or NOT_AUTHORIZED."
-)
-_JSON_TYPES = {"array", "boolean", "integer", "null", "number", "object", "string"}
-
-
-def _schema_type(schema):
-    if schema is False:
-        return "never"
-    kind = schema.get("type") if isinstance(schema, dict) else None
-    if isinstance(kind, str) and kind in _JSON_TYPES:
-        return kind
-    if isinstance(kind, list):
-        return "|".join(sorted({item for item in kind
-                                if isinstance(item, str) and item in _JSON_TYPES})) or "any"
-    return "any"
-
-
-def _signature(schema):
-    properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
-    required = schema.get("required", []) if isinstance(schema, dict) else []
-    if isinstance(properties, dict) and isinstance(required, list):
-        required = {name for name in required if isinstance(name, str)}
-        names = properties.keys() | required
-        if names:
-            return "{" + ", ".join(
-                f"{json.dumps(name, ensure_ascii=False)}{'*' if name in required else ''}: "
-                f"{_schema_type(properties.get(name))}" for name in sorted(names)
-            ) + "}"
-    return "{}" if _schema_type(schema) == "object" else _schema_type(schema)
-
-
-def _execute_description(capabilities):
-    capabilities = sorted(capabilities, key=lambda cap: cap.id)
-    if not capabilities:
-        return _EXECUTE_DESCRIPTION + "\n\nNo capabilities are currently exposed."
-    if len(capabilities) <= _CATALOG_LIMIT:
-        description = _EXECUTE_DESCRIPTION + "\n\nCapabilities (* required):"
-        for cap in capabilities:
-            description += (
-                f"\n{cap.id} [{cap.classification}] ({_signature(cap.input_schema)}) "
-                f"— {' '.join(cap.description.split())}"
-            )
-            encoded = description.encode("utf-8", errors="replace")
-            if len(encoded) > _DESCRIPTION_BYTES:
-                break
-        else:
-            return encoded.decode("utf-8")
-
-    counts = Counter(cap.id.rpartition(".")[0] or "(unqualified)" for cap in capabilities)
-    description = _EXECUTE_DESCRIPTION + "\n\nUse search to discover capabilities. Namespace counts:"
-    overflow = "\nAdditional namespaces available through search."
-    omitted = False
-    for namespace, count in sorted(counts.items()):
-        line = f"\n{namespace}: {count}"
-        if len((description + line + overflow).encode("utf-8")) > _DESCRIPTION_BYTES:
-            omitted = True
-        else:
-            description += line
-    return description + overflow if omitted else description
-
-
-def _brief(text, limit=256):
-    return text if len(text) <= limit else text[:limit - 1] + "…"
-
-
-def _recipe_description(description, recipes):
-    if not recipes:
-        return description
-    heading = "\n\nRecipes (* required):"
-    overflow = "\nUse search to discover more recipes."
-    lines = [
-        f"\n{recipe['name']} [{_recipe_class(recipe)}] ({_brief(_signature(recipe['input_schema']))}) "
-        f"— {_brief(' '.join(recipe['description'].split()))}"
-        for recipe in recipes
-    ]
-    # Reserve space for recipe discovery even when the capability catalog is full.
-    available = min(_DESCRIPTION_BYTES * 3 // 4, _DESCRIPTION_BYTES - len((heading + overflow).encode()))
-    if len(description.encode()) > available:
-        description = description.encode()[:available].decode(errors="ignore").rsplit("\n", 1)[0]
-    description += heading
-    for line in lines:
-        if len((description + line + overflow).encode()) > _DESCRIPTION_BYTES:
-            return description + overflow
-        description += line
-    return description
-
-
-def _recipe_class(recipe):
-    return "write" if any(record["class"] == "write"
-                          for record in recipe["capabilities"].values()) else "read"
+from .embed import Host, RunContext, _RunBinding
+from .invocation import CallError
 
 
 def create_server(registry, dispatch=None, *, allowed_capability_ids=None,
@@ -137,6 +33,36 @@ def create_server(registry, dispatch=None, *, allowed_capability_ids=None,
         if visible.resolve(capability_id).classification == "write":
             raise CallError("DENIED", dispatched=False, audit_reason="WRITE_POLICY")
         return dispatch(capability_id, args, deadline=deadline)
+
+    def catalog_provider(_context):
+        if live:
+            return (cap for cap, _ in registry.catalog(allowed))
+        return (visible.resolve(name) for name in visible.ids)
+
+    class ProxyHost(Host):
+        async def _bind_run(self, context, run_id, source, recipe_name):
+            if not live:
+                return _RunBinding(allowed, dispatch_read if dispatch is not None else None,
+                                   budgets, ledger_path=ledger_path)
+
+            capture = RunCapture(run_id, source)
+            if recipe_name is not None:
+                ids, route, limits, path, recipe = await to_thread.run_sync(
+                    lambda: registry.bind_run(capture_run=capture, recipe_name=recipe_name,
+                                              allowed=allowed),
+                )
+            else:
+                ids, route, limits, path = registry.bind_run(
+                    include_settings=True, capture_run=capture,
+                )
+                ids = ids if allowed is None else allowed.intersection(ids)
+                recipe = None
+            return _RunBinding(ids, route, limits, ledger_path=path, tracks_send=True,
+                               capture=capture, recipe=recipe)
+
+    # Configured transports mark the send boundary at downstream admission.
+    host = ProxyHost(catalog_provider=catalog_provider)
+    proxy_context = RunContext("mcp", "mcp", "mcp")
 
     @asynccontextmanager
     async def lifespan(_server):
@@ -228,12 +154,10 @@ def create_server(registry, dispatch=None, *, allowed_capability_ids=None,
             response["unavailable"] = unavailable
         return response
 
-    @server.tool(description=_EXECUTE_DESCRIPTION if live else _execute_description(
-        visible.resolve(name) for name in visible.ids
-    ))
+    @server.tool(description=_EXECUTE_DESCRIPTION if live else host.catalog_text(proxy_context))
     async def execute(source: str) -> dict[str, Any]:
         """Run a JavaScript async function body. Use return to produce a JSON value."""
-        return await execute_run(source)
+        return await host.execute(source, proxy_context)
 
     if live:
         @server.tool()
@@ -252,54 +176,10 @@ def create_server(registry, dispatch=None, *, allowed_capability_ids=None,
         @server.tool()
         async def run_recipe(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             """Run an approved recipe with validated arguments. Undeclared calls fail with RECIPE_UNDECLARED."""
-            return await execute_run("", name, arguments)
-
-    async def execute_run(source, name=None, arguments=None):
-        run_id = uuid4().hex
-        capture = RunCapture(run_id, source) if live else None
-        recipe_metadata = None
-        if name is not None:
             try:
-                ids, run_dispatch, run_budgets, run_ledger, recipe = await to_thread.run_sync(
-                    lambda: registry.bind_run(capture_run=capture, recipe_name=name, allowed=allowed),
-                )
+                return await host.run_recipe(name, arguments, proxy_context)
             except ConfigError as error:
                 raise ToolError(str(error)) from None
-            try:
-                _check_value(arguments)
-                _validator(recipe["input_schema"]).validate(arguments)
-            except (ValidationError, ValueError, RecursionError):
-                raise ToolError("INVALID_ARGUMENTS: arguments do not match the recipe schema.") from None
-            except Exception:
-                raise ToolError("INVALID_ARGUMENTS: recipe schema could not be evaluated.") from None
-            source = recipe["source"]
-            recipe_metadata = {"recipe": name, "source_digest": recipe["approval"]["source_digest"]}
-        elif live:
-            ids, run_dispatch, run_budgets, run_ledger = registry.bind_run(
-                include_settings=True, capture_run=capture,
-            )
-            ids = ids if allowed is None else allowed.intersection(ids)
-        else:
-            ids, run_dispatch = allowed, dispatch_read if dispatch is not None else None
-            run_budgets, run_ledger = budgets, ledger_path
-        authorization = RunAuthorization(run_id, ids)
-
-        def run():
-            if capture is not None:
-                capture.start(run_ledger)
-            return run_javascript(
-                source, run_id=run_id, authorization=authorization, dispatch=run_dispatch,
-                budgets=run_budgets, ledger_path=run_ledger, tracks_send=live, _capture=capture,
-                recipe=recipe_metadata, arguments=arguments,
-            )
-
-        result = asdict(await to_thread.run_sync(run))
-        return {
-            "run_id": run_id,
-            **result,
-            "actions": list(result["actions"]),
-            "unknown_calls": list(result["unknown_calls"]),
-        }
 
     return server
 
