@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 import shutil
 import socket
+import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -11,11 +13,90 @@ from unittest.mock import patch
 
 from native_support import require_native, run_native
 from src.wyrit.capabilities import RunAuthorization
-from src.wyrit.native_sandbox import LINUX_DATA_BYTES, _file_chain, _mac_profile
+from src.wyrit.native_sandbox import (
+    LINUX_DATA_BYTES, SandboxUnavailable, _export_linux_filter, _file_chain, _mac_profile,
+    native_command,
+)
 from src.wyrit.runtime import run_javascript
 
 
 class NativeSandboxTests(unittest.TestCase):
+    def test_verifier_refuses_wrong_platform_and_missing_bubblewrap(self):
+        script = Path(__file__).resolve().parents[1] / "scripts/verify-linux.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            tools = Path(directory)
+            (tools / "dirname").symlink_to(shutil.which("dirname"))
+            uname = tools / "uname"
+            uname.write_text('#!/bin/sh\nprintf "%s\\n" "$FAKE_KERNEL"\n')
+            uname.chmod(0o755)
+            for kernel, reason in (
+                ("Darwin", "a Linux host is required"),
+                ("Linux", "Bubblewrap is required"),
+            ):
+                with self.subTest(kernel=kernel):
+                    result = subprocess.run(
+                        ["/bin/sh", str(script)], env={"PATH": directory, "FAKE_KERNEL": kernel},
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn(reason, result.stderr)
+                    self.assertIn("Containment probes: NOT RUN", result.stderr)
+
+    def test_linux_without_opt_in_never_launches_node(self):
+        with patch.dict(os.environ), patch(
+            "src.wyrit.native_sandbox.sys.platform", "linux",
+        ), patch("src.wyrit.native_sandbox.platform.machine", return_value="x86_64"), patch(
+            "src.wyrit.runtime.shutil.which", return_value="/node",
+        ), patch("src.wyrit.runtime.subprocess.Popen") as launch:
+            os.environ.pop("WYRIT_ENABLE_LINUX_SANDBOX", None)
+            result = run_javascript("return 1;", run_id="native",
+                                    authorization=RunAuthorization("native", set()))
+        self.assertEqual(result.status, "FAILED")
+        self.assertEqual(result.reason, "Linux native sandbox is not verified for this environment")
+        launch.assert_not_called()
+
+    def test_linux_refuses_setuid_launcher_before_inspecting_node(self):
+        with patch.dict(os.environ, {"WYRIT_ENABLE_LINUX_SANDBOX": "1"}), patch(
+            "src.wyrit.native_sandbox.sys.platform", "linux",
+        ), patch(
+            "src.wyrit.native_sandbox.platform.machine", return_value="x86_64",
+        ), patch("src.wyrit.native_sandbox.os.access", return_value=True), patch(
+            "src.wyrit.native_sandbox.os.stat", return_value=os.stat_result(
+                (stat.S_ISUID, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+            ),
+        ), patch("src.wyrit.native_sandbox._linux_runtime_files") as inspect:
+            with self.assertRaisesRegex(SandboxUnavailable, "non-setuid Bubblewrap"):
+                with native_command("/node", [], deadline=0):
+                    self.fail("unexpected launch command")
+        inspect.assert_not_called()
+
+    def test_linux_refuses_missing_seccomp_library(self):
+        with patch("src.wyrit.native_sandbox.ctypes.CDLL", side_effect=OSError):
+            with self.assertRaisesRegex(SandboxUnavailable, "libseccomp.so.2 is required"):
+                _export_linux_filter(-1)
+
+    def test_linux_namespace_rejection_reports_reason_without_running_guest(self):
+        launch = subprocess.Popen
+
+        @contextmanager
+        def rejected(*args, **kwargs):
+            yield ["/usr/bin/prlimit"], ()
+
+        def reject(command, **kwargs):
+            self.assertEqual(command, ["/usr/bin/prlimit"])
+            return launch([sys.executable, "-c",
+                           'import sys; sys.exit("bwrap: Creating new namespace failed: Operation not permitted")'],
+                          **kwargs)
+
+        with patch("src.wyrit.runtime.native_command", rejected), patch(
+            "src.wyrit.runtime.shutil.which", return_value="/node",
+        ), patch("src.wyrit.runtime.subprocess.Popen", side_effect=reject):
+            result = run_javascript('return await tools.call("fake.echo", 1);', run_id="native",
+                                    authorization=RunAuthorization("native", {"fake.echo"}))
+        self.assertEqual(result.status, "FAILED")
+        self.assertEqual(result.reason, "Bubblewrap could not establish required Linux namespaces")
+        self.assertEqual(result.actions, ())
+
     def test_macos_profile_limits_sysctl_reads_to_kernel_names_and_hardware_prefixes(self):
         with patch("src.wyrit.native_sandbox._mac_runtime_files", return_value={"/node"}), patch(
             "src.wyrit.native_sandbox._file_chain", return_value=("/node",),
@@ -123,13 +204,19 @@ class NativeSandboxTests(unittest.TestCase):
                 result = run_native(node, script)
             self.assertEqual(result.returncode, 0, result.stderr)
             observed = json.loads(result.stdout)
-            self.assertIn(observed["read"], {"EPERM", "EACCES", "ENOENT"})
-            self.assertIn(observed["write"], {"EPERM", "EACCES", "ENOENT", "EROFS"})
-            self.assertIn(observed["spawn"], {"EPERM", "EACCES"})
-            self.assertIn(observed["tcp"], {"EPERM", "EACCES"})
-            self.assertIn(observed["ipc"], {"EPERM", "EACCES", "ENOENT"})
-            self.assertEqual(observed["env"], [])
-            self.assertFalse(output.exists())
+            denied = {"EPERM", "EACCES"}
+            outcomes = {
+                "read": observed["read"] in denied | {"ENOENT"},
+                "write": observed["write"] in denied | {"ENOENT", "EROFS"} and not output.exists(),
+                "env": observed["env"] == [],
+                "spawn": observed["spawn"] in denied,
+                "tcp": observed["tcp"] in denied,
+                "ipc": observed["ipc"] in denied | {"ENOENT"},
+            }
+            for probe, passed in outcomes.items():
+                print(f"\nContainment probe {probe}: {'PASS' if passed else 'FAIL'}", file=sys.stderr)
+                with self.subTest(probe=probe):
+                    self.assertTrue(passed, "Native policy did not produce the expected denial")
 
     @unittest.skipUnless(sys.platform == "linux", "Linux-only data limit")
     def test_linux_data_limit_survives_exec(self):

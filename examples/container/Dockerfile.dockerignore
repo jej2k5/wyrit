@@ -1,0 +1,11 @@
+**
+!pyproject.toml
+!src/
+!src/**
+!bench/
+!bench/**
+!tests/
+!tests/**
+!scripts/
+!scripts/verify-linux.sh
+**/__pycache__

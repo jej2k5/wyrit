@@ -6,8 +6,9 @@ import shutil
 import subprocess
 import sys
 import time
+from unittest.mock import patch
 
-from src.wyrit.native_sandbox import LINUX_LAUNCHER, MAC_LAUNCHER, native_command
+from src.wyrit.native_sandbox import LINUX_LAUNCHER, MAC_LAUNCHER, SandboxUnavailable, native_command
 
 
 def run_native(node, script):
@@ -46,8 +47,17 @@ def _unsupported_reason():
 
 
 def require_native(test):
-    reason = _unsupported_reason()
+    required = os.environ.get("WYRIT_REQUIRE_NATIVE_SANDBOX") == "1"
+    if sys.platform == "linux":
+        if required:
+            test.enterContext(patch.dict(os.environ, {"WYRIT_ENABLE_LINUX_SANDBOX": "1"}))
+        elif os.environ.get("WYRIT_ENABLE_LINUX_SANDBOX") != "1":
+            test.skipTest("Linux native sandbox is not verified for this environment")
+    try:
+        reason = _unsupported_reason()
+    except SandboxUnavailable as error:
+        reason = str(error)
     if reason:
-        if os.environ.get("WYRIT_REQUIRE_NATIVE_SANDBOX") == "1":
+        if required:
             test.fail(reason)
         test.skipTest(reason)

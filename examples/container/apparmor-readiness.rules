@@ -1,0 +1,2 @@
+  # Diagnostic-only addition to the daemon's effective default profile.
+  userns,

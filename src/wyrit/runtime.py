@@ -282,6 +282,7 @@ def _run(source, run_id, authorization, dispatch, cancel_event, budgets, audit, 
             "-e", driver,
         ], deadline=budget.deadline) as (command, descriptors):
             remaining()
+            bubblewrap = command[:1] == ["/usr/bin/prlimit"]
             child = subprocess.Popen(
                 command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 env={}, cwd="/", bufsize=0, pass_fds=descriptors,
@@ -298,7 +299,8 @@ def _run(source, run_id, authorization, dispatch, cancel_event, budgets, audit, 
 
     with child:
         try:
-            result = _exchange(child, initial, protocol, remaining, wait_interval, budget.global_limits["max_output_bytes"])
+            result = _exchange(child, initial, protocol, remaining, wait_interval,
+                               budget.global_limits["max_output_bytes"], bubblewrap=bubblewrap)
         except _RunCancelled:
             result = RunResult("CANCELLED", reason="Run cancellation requested",
                                cancellation_requested=True)
@@ -329,9 +331,10 @@ def _remaining(deadline):
     return seconds
 
 
-def _exchange(child, initial, protocol, remaining, wait_interval, output_limit):
+def _exchange(child, initial, protocol, remaining, wait_interval, output_limit, *, bubblewrap):
     outgoing = initial + b"\n"
     buffered = bytearray()
+    stderr = bytearray()
     totals = {"stdout": 0, "stderr": 0}
     limits = {"stdout": STDOUT_BYTES, "stderr": STDERR_BYTES}
     terminal = None
@@ -356,6 +359,12 @@ def _exchange(child, initial, protocol, remaining, wait_interval, output_limit):
                     chunk = os.read(key.fd, 8192)
                 except BlockingIOError:
                     continue
+                except BrokenPipeError:
+                    if channel != "stdin":
+                        raise
+                    # The launcher can refuse isolation before reading any input.
+                    selector.unregister(key.fileobj)
+                    continue
                 if not chunk:
                     selector.unregister(key.fileobj)
                     continue
@@ -364,6 +373,8 @@ def _exchange(child, initial, protocol, remaining, wait_interval, output_limit):
                     raise LimitExceeded(f"runtime_{channel}_bytes", Limit(limits[channel], "default"),
                                         f"Runtime {channel} limit exceeded")
                 if channel == "stderr":
+                    if bubblewrap:
+                        stderr.extend(chunk)
                     continue
 
                 buffered.extend(chunk)
@@ -407,5 +418,12 @@ def _exchange(child, initial, protocol, remaining, wait_interval, output_limit):
             remaining()
     remaining()
     if buffered or terminal is None or exit_code:
+        if bubblewrap and exit_code and not totals["stdout"]:
+            if stderr.startswith(b"bwrap:"):
+                if b"namespace" in stderr.lower():
+                    raise _RunFailure("Bubblewrap could not establish required Linux namespaces")
+                raise _RunFailure("Bubblewrap could not establish the required Linux sandbox")
+            if stderr.startswith(b"prlimit:"):
+                raise _RunFailure("Could not apply the required Linux runtime data limit")
         raise _RunFailure("JavaScript runtime terminated without a valid outcome")
     return terminal

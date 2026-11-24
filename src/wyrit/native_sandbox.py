@@ -149,7 +149,10 @@ class _ArgComparison(ctypes.Structure):
 
 
 def _export_linux_filter(fd):
-    seccomp = ctypes.CDLL("libseccomp.so.2")
+    try:
+        seccomp = ctypes.CDLL("libseccomp.so.2")
+    except OSError as error:
+        raise SandboxUnavailable("libseccomp.so.2 is required for Linux syscall isolation") from error
     init = seccomp.seccomp_init
     init.argtypes = [ctypes.c_uint32]
     init.restype = ctypes.c_void_p
@@ -202,8 +205,12 @@ def native_command(node, arguments, *, deadline):
                    "--openssl-config=/dev/null", *arguments], ()
             return
         if sys.platform == "linux" and platform.machine() in {"x86_64", "aarch64"}:
+            if os.environ.get("WYRIT_ENABLE_LINUX_SANDBOX") != "1":
+                raise SandboxUnavailable("Linux native sandbox is not verified for this environment")
             if not all(os.access(path, os.X_OK) for path in (LINUX_LAUNCHER, "/usr/bin/prlimit")):
                 raise SandboxUnavailable("Bubblewrap and prlimit are required")
+            if os.stat(LINUX_LAUNCHER).st_mode & stat.S_ISUID:
+                raise SandboxUnavailable("A non-setuid Bubblewrap is required for Linux user namespace isolation")
             interpreter, files = _linux_runtime_files(os.path.realpath(node), deadline)
             libraries = ":".join(sorted({os.path.dirname(path) for path in files}))
             with tempfile.TemporaryFile() as policy:
