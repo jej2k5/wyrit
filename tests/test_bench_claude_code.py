@@ -153,12 +153,17 @@ class ClaudeCodeTests(unittest.TestCase):
                 row = run_claude(self.task, approach, self.settings, {**self.env, "FAKE_MODE": "mcp"})
                 self.assertIsNone(row["error"])
                 record = self.calls()[-1]
-                args = record["args"]
+                args = list(record["args"])
                 server = "bench" if approach == "direct" else "wyrit"
+                # macOS temp paths reach the child as /private/var; compare the resolved file.
+                config = args.index("--mcp-config") + 1
+                self.assertEqual(Path(args[config]).resolve(),
+                                 (Path(record["cwd"]).parent / "mcp.json").resolve())
+                args[config] = "<mcp.json>"
                 self.assertEqual(args, [
                     "-p", self.task["prompt"] + JSON_INSTRUCTION, "--output-format", "stream-json",
                     "--verbose", "--model", "test-model", "--tools", "", "--strict-mcp-config",
-                    "--mcp-config", str(Path(record["cwd"]).parent / "mcp.json"),
+                    "--mcp-config", "<mcp.json>",
                     "--allowedTools", f"mcp__{server}", "--permission-mode", "dontAsk",
                     "--no-session-persistence", "--setting-sources", "", "--disable-slash-commands",
                     "--append-system-prompt", SYSTEM[approach],

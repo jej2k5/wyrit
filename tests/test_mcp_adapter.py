@@ -231,7 +231,6 @@ class MCPAdapterTests(unittest.TestCase):
             ActionRecord(3, "demo.sample", "SUCCEEDED", "INVALID_RESULT"),
             ActionRecord(4, "demo.sample", "SUCCEEDED", "RESULT_TOO_LARGE"),
             ActionRecord(5, "demo.sample", "SUCCEEDED", "RESULT_TOO_LARGE"),
-            ActionRecord(6, "demo.sample", "SUCCEEDED", "RESULT_TOO_LARGE"),
             ActionRecord(6, "demo.sample", "FAILED", "TOOL_ERROR"),
             ActionRecord(7, "demo.sample", "UNKNOWN", "OUTCOME_UNKNOWN"),
             ActionRecord(8, "demo.increment", "UNKNOWN", "INVALID_RESULT"),
