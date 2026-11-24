@@ -228,7 +228,9 @@ def native_command(node, arguments, *, deadline):
                     command.extend(("--ro-bind", source, target))
                 command.extend(("--remount-ro", "/", "--chdir", "/", "--seccomp",
                                 str(policy.fileno()), "--", interpreter, "--library-path",
-                                libraries, "/node", *arguments))
+                                # No JIT: newer kernels count V8's code-range reservation against
+                                # the data limit, and guest scripts never need generated code.
+                                libraries, "/node", "--jitless", *arguments))
                 yield command, (policy.fileno(),)
             return
     except TimeoutError:
