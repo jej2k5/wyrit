@@ -13,3 +13,10 @@ Extend the phase 14 benchmark so the operator can measure phases 15 and 16 again
 **Operator run.** Calibration and authorization stay as in phase 14 (Claude Code driver by default). The handoff gives the exact commands, with `--tasks bench/tasks`.
 
 Tests (offline, fake `claude` as in phase 14): the generator is deterministic and its output matches the checked-in tasks; `wyrit-recipe` writes an approved, runnable recipe and passes `run_recipe` through the allowed tools; tasks without recipes skip the approach; the report renders three approaches and the ratios. Produce the phase handoff.
+
+**Recipes page polish (operator review of phase 16, 2026-11-23).** The operator approved phase 16; the flow and rules are right, the page is thin. In the same console, same design rules:
+1. Each recipe row shows, without expanding: name, description, a clear write badge when any declared capability is a write, state (pending, runnable, unapproved, stale with the capability named), and run count and success rate from the ledger.
+2. Fill the empty summary bar at the top of the page with counts by state and a "needs review" item when anything is pending, unapproved or stale.
+3. **Save as recipe** from Monitoring: on a successful run whose source was captured (phase 13 stores generated code for 7 days), offer "Save as recipe", which opens a short form (name, description, argument schema prefilled as an empty object with a note that `args` is unused unless the operator edits the source) and submits it through the same validation as `propose_recipe`, landing as pending. Never approve in the same step.
+4. Keep "recipe" as the working name throughout; the operator may rename the concept later, so keep the user-facing word in one place in the console code rather than scattered literals.
+Tests: rows render description, write badge, state and stats; the summary counts match; Save as recipe creates a pending recipe from a captured run and is unavailable when the source was not captured or the run failed.

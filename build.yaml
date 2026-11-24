@@ -107,7 +107,8 @@
     "lean": 15,
     "recipes": 16,
     "proven": 17,
-    "complete": 19
+    "embeddable": 18,
+    "complete": 20
   },
   "checkpoints": {
     "before_phases": [
@@ -116,7 +117,7 @@
       7,
       13,
       18,
-      19
+      20
     ],
     "mvp_completion": 7
   },
@@ -367,13 +368,31 @@
           "package-lock.json",
           "docs/HANDOFF_PHASE_{phase}.md",
           "bench/"
-        ]
+        ],
+        "merge_policy": "human"
       }
     },
     {
       "number": 18,
+      "name": "Embeddable host",
+      "prompt": "prompts/phases/phase-18-embeddable-host.md",
+      "acceptance": {
+        "allowed_paths": [
+          "src/",
+          "tests/",
+          "pyproject.toml",
+          "package.json",
+          "package-lock.json",
+          "docs/HANDOFF_PHASE_{phase}.md",
+          "docs/EMBEDDING.md",
+          "examples/embed/"
+        ]
+      }
+    },
+    {
+      "number": 19,
       "name": "Linux verification",
-      "prompt": "prompts/phases/phase-18-linux-verification.md",
+      "prompt": "prompts/phases/phase-19-linux-verification.md",
       "acceptance": {
         "allowed_paths": [
           "src/",
@@ -383,14 +402,16 @@
           "package-lock.json",
           "docs/HANDOFF_PHASE_{phase}.md",
           "scripts/verify-linux.sh",
-          ".github/workflows/linux-sandbox.yml"
+          ".github/workflows/linux-sandbox.yml",
+          "scripts/verify-linux-container.sh",
+          "examples/container/"
         ]
       }
     },
     {
-      "number": 19,
+      "number": 20,
       "name": "Works with MCPxy (optional pairing)",
-      "prompt": "prompts/phases/phase-19-works-with-mcpxy.md",
+      "prompt": "prompts/phases/phase-20-works-with-mcpxy.md",
       "acceptance": {
         "allowed_paths": [
           "src/",

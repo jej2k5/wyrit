@@ -1,4 +1,4 @@
-# Phase 19: Works with MCPxy (optional pairing)
+# Phase 20: Works with MCPxy (optional pairing)
 
 Wyrit stands alone; MCPxy is one way to run it, not a dependency. To Wyrit, MCPxy is just another downstream MCP server, so add no MCPxy-specific code. Verify and document the pairing.
 
