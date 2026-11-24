@@ -72,7 +72,7 @@ def make_plan(args, tasks, github_available):
     active = [task["id"] for task in tasks if task["id"] not in skipped]
     if not active:
         raise ValueError("No runnable tasks")
-    return {"version": 3 if args.driver == "claude-code" else 2,
+    return {"version": 4,
             "driver": args.driver, "suite_digest": digest(tasks), "active_tasks": active,
             "skipped_tasks": skipped, "approaches": list(APPROACHES),
             "settings": settings, "repetitions": args.repetitions}
@@ -85,6 +85,8 @@ def run_suite(tasks, plan, repetitions, model, env):
             # Alternate the order across repetitions to reduce order effects.
             approaches = APPROACHES if repetition % 2 else APPROACHES[::-1]
             for approach in approaches:
+                if approach == "wyrit-recipe" and "recipe" not in task:
+                    continue
                 if plan["driver"] == "api":
                     row = run_agent(task, approach, model, settings)
                     prices = settings["prices_per_million"]

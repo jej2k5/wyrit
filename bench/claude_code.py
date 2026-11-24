@@ -5,44 +5,16 @@ import os
 from pathlib import Path
 import signal
 import subprocess
-import sys
 from tempfile import TemporaryDirectory
 from time import monotonic
 
 from .agent import JSON_INSTRUCTION, SYSTEM, check_answer, error_details, error_row, read_outcomes
-from .tasks import canonical
+from .setup import mcp_config
 
-ROOT = Path(__file__).resolve().parent.parent
+
 COST_LABEL = "list-price equivalent; billed to the subscription"
 TOKEN_FIELDS = ("input_tokens", "output_tokens", "cache_creation_input_tokens",
                 "cache_read_input_tokens")
-
-
-def mcp_config(directory, task, approach):
-    fixture = directory / "fixture.json"
-    fixture.write_text(canonical({"tools": task["tools"]}), encoding="utf-8")
-    downstream = [str(ROOT / "bench" / "fixture_stdio.py"), str(fixture),
-                  str(directory / "requests.jsonl")]
-    if approach == "direct":
-        servers = {"bench": {"command": sys.executable, "args": [*downstream, "--direct"]}}
-    else:
-        config = directory / "wyrit.toml"
-        config.write_text(
-            'ledger_path = "runs.jsonl"\n[servers.bench]\ntransport = "stdio"\n'
-            'namespace = "bench"\nexpose = "all"\ndeny_writes = true\n'
-            f'command = {json.dumps(sys.executable, ensure_ascii=False)}\n'
-            f'args = {json.dumps(downstream, ensure_ascii=False)}\n',
-            encoding="utf-8",
-        )
-        servers = {"wyrit": {
-            "command": sys.executable,
-            "args": ["-m", "wyrit.mcp_server", "--config", str(config)],
-            "env": {"PYTHONPATH": str(ROOT / "src")},
-        }}
-    path = directory / "mcp.json"
-    config = {"mcpServers": servers}
-    path.write_text(canonical(config), encoding="utf-8")
-    return path, config
 
 
 def json_lines(stream):
@@ -83,8 +55,9 @@ def _run_claude(task, approach, settings, env, row):
         cwd.mkdir()
         config_path, config = mcp_config(directory, task, approach)
         allowed_tools = [f"mcp__{name}" for name in sorted(config["mcpServers"])]
+        prompt = task["prompt"] if approach == "wyrit-recipe" else task["prompt"] + JSON_INSTRUCTION
         args = [
-            "claude", "-p", task["prompt"] + JSON_INSTRUCTION,
+            "claude", "-p", prompt,
             "--output-format", "stream-json", "--verbose", "--model", settings["model"],
             "--tools", "", "--strict-mcp-config", "--mcp-config", str(config_path),
             "--allowedTools", *allowed_tools, "--permission-mode", "dontAsk",
@@ -117,13 +90,16 @@ def _run_claude(task, approach, settings, env, row):
         records = read_log(directory / "requests.jsonl")
         requests = [record["request"] for record in records if record["request"] is not None]
         row["downstream_calls"] = len(requests)
+        successful_recipes = []
         if approach == "direct":
             outcomes.extend(record["outcome"] for record in records)
         else:
             read_outcomes(directory / "runs.jsonl",
                           lambda capability: (capability or "").removeprefix("bench.") or None,
-                          execution_statuses, outcomes)
+                          execution_statuses, outcomes, successful_recipes=successful_recipes)
         row["correct"] = not error and check_answer(task, answer, requests, outcomes)
+        if approach == "wyrit-recipe":
+            row["correct"] = row["correct"] and task["recipe"]["name"] in successful_recipes
 
 
 def invoke(args, cwd, env, timeout):

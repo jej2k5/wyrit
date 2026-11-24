@@ -1,6 +1,6 @@
 {
   "model": "claude-sonnet-4-6",
-  "max_turns": 16,
+  "max_turns": 40,
   "max_tokens": 2048,
   "prices_per_million": {
     "claude-sonnet-4-6": {"input": 3, "output": 15}

@@ -12,13 +12,15 @@ from anyio.from_thread import start_blocking_portal
 from mcp.shared.memory import create_connected_server_and_client_session
 
 from src.wyrit.capabilities import CapabilityRegistry
+from src.wyrit.configured_host import configured_host
 from src.wyrit.mcp_adapter import MCPAdapter
 from src.wyrit.mcp_server import create_server
 
+from .setup import mcp_config
 from .tasks import canonical, check, downstream_server
 
 
-APPROACHES = ("direct", "wyrit")
+APPROACHES = ("direct", "wyrit", "wyrit-recipe")
 JSON_INSTRUCTION = "\nReturn only the requested JSON value."
 SYSTEM = {
     "direct": "Use the supplied MCP tools to complete the task.",
@@ -29,6 +31,10 @@ SYSTEM = {
         "Catch individual tool errors if you need to continue after a failure."
     ),
 }
+SYSTEM["wyrit-recipe"] = (
+    SYSTEM["wyrit"] + " When a matching reviewed recipe appears in the execute catalog, use run_recipe."
+    + JSON_INSTRUCTION
+)
 
 
 def error_details(error):
@@ -44,7 +50,7 @@ def error_row(error, elapsed):
     }
 
 
-def read_outcomes(path, tool_names, execution_statuses, outcomes):
+def read_outcomes(path, tool_names, execution_statuses, outcomes, *, successful_recipes=None):
     try:
         stream = path.open(encoding="utf-8")
     except FileNotFoundError:
@@ -68,6 +74,8 @@ def read_outcomes(path, tool_names, execution_statuses, outcomes):
                 continue
             execution_statuses.append(run["outcome"])
             outcomes.extend(actions)
+            if successful_recipes is not None and run["outcome"] == "SUCCESS":
+                successful_recipes.append(run.get("recipe"))
     if malformed:
         raise ValueError(f"Malformed runs.jsonl at line {malformed[0]} ({len(malformed)} invalid records)")
 
@@ -98,10 +106,13 @@ def _run_agent(task, approach, model, settings):
             if approach == "direct":
                 outcomes.append(outcome)
 
-        downstream = connect(downstream_server(task, record, deny_writes_at_entry=approach == "direct"))
-        adapter = MCPAdapter("bench", downstream, portal)
-        capabilities = {cap.adapter_metadata["tool_name"]: cap for cap in adapter.capabilities}
-        ids = frozenset(cap.id for cap in capabilities.values())
+        if approach == "wyrit-recipe":
+            tool_names = {f"bench.{name}": name for name in task["tools"]}
+        else:
+            downstream = connect(downstream_server(task, record, deny_writes_at_entry=approach == "direct"))
+            adapter = MCPAdapter("bench", downstream, portal)
+            capabilities = {cap.adapter_metadata["tool_name"]: cap for cap in adapter.capabilities}
+            tool_names = {cap.id: name for name, cap in capabilities.items()}
         if approach == "direct":
             tools = [
                 {"name": name, "description": cap.description, "input_schema": cap.input_schema}
@@ -121,17 +132,21 @@ def _run_agent(task, approach, model, settings):
                 return (blocks if result is None else result), False
 
         else:
-            directory = stack.enter_context(TemporaryDirectory())
-            ledger = Path(directory) / "runs.jsonl"
-            server = create_server(CapabilityRegistry(capabilities.values()), adapter.dispatch,
-                                   allowed_capability_ids=ids, ledger_path=ledger)
+            directory = Path(stack.enter_context(TemporaryDirectory()))
+            ledger = directory / "runs.jsonl"
+            if approach == "wyrit-recipe":
+                mcp_config(directory, task, approach)
+                host = stack.enter_context(configured_host(directory / "wyrit.toml"))
+                server = create_server(host, allowed_capability_ids=tool_names)
+            else:
+                server = create_server(CapabilityRegistry(capabilities.values()), adapter.dispatch,
+                                       allowed_capability_ids=tool_names, ledger_path=ledger)
             session = connect(server._mcp_server)
             tools = [
                 {"name": tool.name, "description": tool.description, "input_schema": tool.inputSchema}
                 for tool in portal.call(session.list_tools).tools
             ]
             names = {tool["name"] for tool in tools}
-            tool_names = {cap.id: name for name, cap in capabilities.items()}
 
             def invoke(name, arguments):
                 if name not in names:
@@ -146,15 +161,22 @@ def _run_agent(task, approach, model, settings):
                             result = json.loads(blocks[0]["text"])
                         except (ValueError, RecursionError):
                             pass
-                if name == "execute":
+                if name in {"execute", "run_recipe"}:
                     execution_statuses.append(result.get("status") if isinstance(result, dict)
                                               else "MCP_ERROR")
                 return result, response.isError
 
         metrics = run_loop(task["prompt"], approach, model, settings, tools, invoke)
-        if approach == "wyrit":
+        successful_recipes = []
+        if approach != "direct":
             try:
-                read_outcomes(ledger, tool_names.get, [], outcomes)
+                read_outcomes(ledger, tool_names.get, [], outcomes, successful_recipes=successful_recipes)
+                if approach == "wyrit-recipe":
+                    request_log = directory / "requests.jsonl"
+                    if request_log.exists():
+                        with request_log.open(encoding="utf-8") as stream:
+                            requests.extend(record["request"] for record in map(json.loads, stream)
+                                            if record["request"] is not None)
             except (OSError, ValueError) as error:
                 details = error_details(error)
                 if metrics.get("error"):
@@ -162,6 +184,8 @@ def _run_agent(task, approach, model, settings):
                 metrics.update(details)
         answer = metrics.pop("answer")
         correct = metrics["stop_reason"] == "end_turn" and check_answer(task, answer, requests, outcomes)
+        if approach == "wyrit-recipe":
+            correct = correct and task["recipe"]["name"] in successful_recipes
         return {**metrics, "downstream_calls": len(requests), "correct": correct,
                 "execution_statuses": execution_statuses, "tool_outcomes": outcomes}
 
@@ -179,7 +203,8 @@ def check_answer(task, answer, requests, outcomes):
 
 
 def run_loop(prompt, approach, model, settings, tools, invoke):
-    messages = [{"role": "user", "content": prompt + JSON_INSTRUCTION}]
+    messages = [{"role": "user", "content": prompt if approach == "wyrit-recipe"
+                 else prompt + JSON_INSTRUCTION}]
     input_tokens = output_tokens = tool_calls = 0
     answer = ""
     start = monotonic()

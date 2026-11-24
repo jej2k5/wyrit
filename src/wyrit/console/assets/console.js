@@ -1,7 +1,9 @@
 "use strict";
 
 const page = document.body.dataset.page;
-const titles = {servers: "Servers", capabilities: "Capabilities", policy: "Policy and limits", monitor: "Monitoring", recipes: "Recipes"};
+const recipeLabel = "recipe";
+const titles = {servers: "Servers", capabilities: "Capabilities", policy: "Policy and limits",
+  monitor: "Monitoring", recipes: recipeLabel[0].toUpperCase() + recipeLabel.slice(1) + "s"};
 const token = document.querySelector('meta[name="wyrit-token"]').content;
 const editor = document.getElementById("editor");
 const theme = document.getElementById("theme");
@@ -421,6 +423,51 @@ function capabilityName(name) {
   return label;
 }
 
+function saveSourceForm(source, reference, close) {
+  const form = node("form");
+  const fields = node("div", undefined, "fields");
+  const addField = (title, control, wide = false) => {
+    const label = node("label", title, wide ? "wide" : undefined);
+    control.required = true;
+    label.append(control);
+    fields.append(label);
+    return control;
+  };
+  const name = addField("Name", node("input"));
+  name.pattern = "[a-z][a-z0-9\\-]{0,63}";
+  const description = addField("Description", node("input"));
+  const schema = addField("Argument schema", node("textarea"), true);
+  schema.value = JSON.stringify({type: "object", properties: {}, additionalProperties: false}, null, 2);
+  fields.append(node("p", "Leave the schema as an empty object when the source leaves args unused. You can edit the source and schema to add arguments.", "wide prose muted"));
+  const code = addField("Source", node("textarea"), true);
+  code.value = source;
+  code.rows = 6;
+  const actions = node("div", undefined, "actions");
+  const submit = node("button", "Submit for review", "primary");
+  submit.type = "submit";
+  actions.append(submit, button("Cancel", close));
+  const feedback = node("p");
+  feedback.setAttribute("role", "status");
+  form.append(fields, actions, feedback);
+  form.addEventListener("submit", async event => {
+    event.preventDefault();
+    submit.disabled = true;
+    try {
+      const result = await request("/api/config", {
+        action: "save_captured_source", ...reference, name: name.value, description: description.value,
+        input_schema: JSON.parse(schema.value), ...(code.value === source ? {} : {source: code.value}),
+      });
+      message(result.name + " is pending review in " + titles.recipes + ".");
+      close();
+    } catch (error) {
+      feedback.textContent = error.message;
+    } finally {
+      submit.disabled = false;
+    }
+  });
+  return form;
+}
+
 function runCard(row, preview) {
   const run = row.record;
   const article = node("details", undefined, "run-row");
@@ -436,6 +483,7 @@ function runCard(row, preview) {
     node("span", elapsed(run.ended_at - run.started_at)), node("span", run.run_id.slice(0, 8)), firstLine);
   summary.append(fields);
   const source = node("pre", undefined, "run-source");
+  const save = node("div");
   const unavailable = run.source_status === "withheld" ?
     "source withheld: looked like a credential" : "No retained source";
   let previewExpiry;
@@ -456,7 +504,7 @@ function runCard(row, preview) {
   id.append(document.createTextNode("Run " + run.run_id + " · Ledger "), sourceLink(row.ref));
   article.append(summary, id);
   if (reason) article.append(node("p", reason));
-  article.append(source);
+  article.append(source, save);
   article.append(table(["Call", "Capability", "Outcome", "Duration", "Result size"],
     run.actions.map((action, index) => {
       const status = outcome(action.outcome);
@@ -467,6 +515,7 @@ function runCard(row, preview) {
   const capture = node("details");
   const payload = node("pre");
   const url = monitorUrl("captures", {ref: row.ref});
+  const reference = {ref: row.ref, epoch: monitorEpoch, run_id: run.run_id};
   capture.append(node("summary", "Captured payloads"), payload);
   let requestVersion = 0;
   async function loadCapture() {
@@ -474,6 +523,7 @@ function runCard(row, preview) {
     clearTimeout(sourceExpiry);
     payload.textContent = "";
     source.textContent = "";
+    save.replaceChildren();
     if (!article.open) return;
     source.textContent = "Loading source…";
     try {
@@ -481,8 +531,20 @@ function runCard(row, preview) {
       if (version !== requestVersion || !article.open) return;
       source.textContent = data.source?.text ?? unavailable;
       if (data.source) {
-        sourceExpiry = setTimeout(() => { source.textContent = unavailable; },
-          data.source.remaining_seconds * 1000);
+        sourceExpiry = setTimeout(() => {
+          source.textContent = unavailable;
+          save.replaceChildren();
+        }, data.source.remaining_seconds * 1000);
+        if (data.can_save) {
+          const open = button("Save as " + recipeLabel, () => {
+            const form = saveSourceForm(data.source.text, reference, () => {
+              if (form.parentNode === save) save.replaceChildren(open);
+            });
+            save.replaceChildren(form);
+            form.querySelector("input").focus();
+          });
+          save.append(open);
+        }
       }
       payload.textContent = data.payloads.length ? JSON.stringify(data.payloads, null, 2) :
         "No retained payloads for this run.";
@@ -660,71 +722,82 @@ async function renderRecipes() {
   const {recipes} = await request("/api/recipes");
   const panel = document.getElementById("recipes");
   panel.replaceChildren();
-  if (!recipes.length) panel.append(node("p", "No recipes found.", "prose muted"));
+  if (!recipes.length) panel.append(node("p", "No " + titles.recipes.toLowerCase() + " found.", "prose muted"));
   const labels = {runnable: "Runnable", pending: "Pending", unapproved: "Unapproved", stale: "Stale"};
-  for (const [status, title] of Object.entries(labels)) {
-    const group = recipes.filter(recipe => recipe.state === status);
-    if (!group.length) continue;
-    panel.append(node("h2", title));
-    for (const recipe of group) {
-      const detail = node("details");
-      detail.append(node("summary", recipe.name));
-      if (recipe.reason) detail.append(node("p", recipe.reason));
-      if (recipe.revision) {
-        detail.append(node("p", recipe.description));
-        if (recipe.approval) {
-          detail.append(node("p", "Approval recorded by " + recipe.approval.approved_by +
-            " on " + recipe.approval.approved_at));
-        }
-        detail.append(node("h3", "Source"), node("pre", recipe.source, "run-source"));
-        detail.append(node("h3", "Argument schema"), node("pre", JSON.stringify(recipe.input_schema, null, 2)));
-        detail.append(node("h3", "Capabilities"), table(["Capability", "Recorded class", "Current class"],
-          Object.entries(recipe.capabilities).map(([id, record]) =>
-            [id, record.class, recipe.current_capabilities[id]?.class || "Unavailable"]), "No capability calls."));
-        if (recipe.diff) detail.append(node("h3", "Changes since approval"), node("pre", recipe.diff, "run-source"));
-        const {runs, success_rate, p50_duration, p95_duration} = recipe.stats;
-        if (runs) {
-          detail.append(node("p", runs + " runs · " + (success_rate * 100).toFixed(1) +
-            "% succeeded · p50 " + p50_duration.toFixed(3) + " s · p95 " + p95_duration.toFixed(3) + " s"));
-        } else {
-          detail.append(node("p", "No recorded runs."));
-        }
-        const actions = node("div", undefined, "actions");
-        const operator = node("input");
-        operator.required = true;
-        const label = node("label", "Operator label");
-        label.append(operator);
-        const update = async (action, payload = {}) => {
-          if (busy) return;
-          busy = true;
-          try {
-            const result = await request("/api/config", {
-              action, name: recipe.name, revision: recipe.revision, ...payload,
-            });
-            await renderRecipes();
-            message(result.message);
-          } catch (error) {
-            message(error.message);
-          } finally {
-            busy = false;
-          }
-        };
-        if (recipe.state !== "runnable") {
-          actions.append(label, button("Approve", () => {
-            if (operator.reportValidity()) update("approve_recipe", {operator: operator.value});
-          }, "primary"));
-        }
-        if (recipe.approval) actions.append(button("Revoke", () => update("revoke_recipe")));
-        actions.append(button("Delete", () => {
-          if (window.confirm("Delete " + recipe.name + "?")) update("delete_recipe", {confirm: true});
-        }));
-        detail.append(actions);
-      }
-      panel.append(detail);
+  const counts = Object.fromEntries(Object.keys(labels).map(status => [status, 0]));
+  for (const recipe of recipes) counts[recipe.state]++;
+  const needsReview = counts.pending + counts.unapproved + counts.stale;
+  const strip = document.getElementById("health");
+  strip.setAttribute("aria-label", titles.recipes + " summary");
+  strip.replaceChildren(...Object.entries(labels).map(([status, title]) =>
+    node("span", title + " " + counts[status])));
+  if (needsReview) strip.append(node("strong", "Needs review " + needsReview, "warn"));
+  for (const recipe of recipes) {
+    const detail = node("details", undefined, "recipe-row");
+    const summary = node("summary");
+    const fields = node("span", undefined, "recipe-fields");
+    const {runs, success_rate, p50_duration, p95_duration} = recipe.stats;
+    fields.append(node("strong", recipe.name),
+      node("span", labels[recipe.state], recipe.state === "runnable" ? "ok" : "warn"));
+    if (Object.values(recipe.capabilities ?? {}).some(record => record.class === "write")) {
+      fields.append(node("span", "Write", "write-badge"));
     }
+    fields.append(node("span", runs + (runs === 1 ? " run" : " runs") + " · " +
+      (success_rate == null ? "Success rate —" : (success_rate * 100).toFixed(1) + "% succeeded")));
+    if (recipe.reason) fields.append(node("span", recipe.reason, "prose muted wide"));
+    if (recipe.description) fields.append(node("span", recipe.description, "prose wide"));
+    summary.append(fields);
+    detail.append(summary);
+    if (recipe.revision) {
+      if (recipe.approval) {
+        detail.append(node("p", "Approval recorded by " + recipe.approval.approved_by +
+          " on " + recipe.approval.approved_at));
+      }
+      detail.append(node("h3", "Source"), node("pre", recipe.source, "run-source"));
+      detail.append(node("h3", "Argument schema"), node("pre", JSON.stringify(recipe.input_schema, null, 2)));
+      detail.append(node("h3", "Capabilities"), table(["Capability", "Recorded class", "Current class"],
+        Object.entries(recipe.capabilities).map(([id, record]) =>
+          [id, record.class, recipe.current_capabilities[id]?.class || "Unavailable"]), "No capability calls."));
+      if (recipe.diff) detail.append(node("h3", "Changes since approval"), node("pre", recipe.diff, "run-source"));
+      if (runs) {
+        detail.append(node("p", "p50 " + p50_duration.toFixed(3) + " s · p95 " + p95_duration.toFixed(3) + " s"));
+      }
+      const actions = node("div", undefined, "actions");
+      const operator = node("input");
+      operator.required = true;
+      const label = node("label", "Operator label");
+      label.append(operator);
+      const update = async (action, payload = {}) => {
+        if (busy) return;
+        busy = true;
+        try {
+          const result = await request("/api/config", {
+            action, name: recipe.name, revision: recipe.revision, ...payload,
+          });
+          await renderRecipes();
+          message(result.message);
+        } catch (error) {
+          message(error.message);
+        } finally {
+          busy = false;
+        }
+      };
+      if (recipe.state !== "runnable") {
+        actions.append(label, button("Approve", () => {
+          if (operator.reportValidity()) update("approve_recipe", {operator: operator.value});
+        }, "primary"));
+      }
+      if (recipe.approval) actions.append(button("Revoke", () => update("revoke_recipe")));
+      actions.append(button("Delete", () => {
+        if (window.confirm("Delete " + recipe.name + "?")) update("delete_recipe", {confirm: true});
+      }));
+      detail.append(actions);
+    }
+    panel.append(detail);
   }
 }
 
+document.querySelector('[data-target="recipes"]').textContent = titles.recipes;
 document.getElementById("title").textContent = titles[page];
 document.title = titles[page] + " · Wyrit";
 document.getElementById(page).hidden = false;

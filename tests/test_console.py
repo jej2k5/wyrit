@@ -286,6 +286,89 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual(self.change("capture", seconds=0, **key)[0], 200)
         self.assertEqual(store.settings(), {})
 
+    @unittest.skipUnless(shutil.which("node"), "Node.js required for proposal validation")
+    def test_save_captured_success_creates_pending_and_checks_source_at_submission(self):
+        self.path.write_text('recipes_path = "recipes"\nledger_path = "runs.jsonl"\n')
+        self.assertEqual(self.change("reload")[0], 200)
+        store = CaptureStore(self.host.ledger_path)
+        source = "return {value: 42};"
+        with open_ledger(self.host.ledger_path) as ledger:
+            for run_id, outcome in (("done", "SUCCESS"), ("failed", "FAILED"), ("missing", "SUCCESS")):
+                append_record(ledger, {"run_id": run_id, "started_at": 1, "ended_at": 2,
+                                       "outcome": outcome, "actions": []})
+                if run_id != "missing":
+                    store.save_source(run_id, source, set(), {})
+        epoch = json.loads(self.request("/api/monitor")[1])["epoch"]
+        proposal = {
+            "name": "captured-run", "description": "Reuse the captured calculation",
+            "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+        }
+        for index, run_id in enumerate(("done", "failed", "missing"), 1):
+            ref = f"r{index}"
+            captures = json.loads(self.request(f"/api/captures?ref={ref}&epoch={epoch}")[1])
+            self.assertEqual(captures["can_save"], run_id == "done")
+            if run_id != "done":
+                # Even an explicitly supplied source must originate from an eligible run.
+                self.assertEqual(self.change("save_captured_source", ref=ref, epoch=epoch,
+                                             run_id=run_id, source=source, **proposal)[0], 400)
+        reference = {"ref": "r1", "epoch": epoch, "run_id": "done"}
+        self.assertEqual(self.change("save_captured_source", **reference, **proposal,
+                                     source='return await tools.call("missing.tool", {});')[0], 400)
+        self.assertEqual(self.change("save_captured_source", **reference, **proposal,
+                                     source="return " + json.dumps(self.server.change_token) + ";")[0], 400)
+        status, reply, _ = self.change("save_captured_source", **reference, **proposal)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(reply), {"name": "captured-run", "state": "pending"})
+        recipe, = json.loads(self.request("/api/recipes")[1])["recipes"]
+        self.assertEqual(recipe["source"], source)
+        self.assertEqual(recipe["input_schema"], proposal["input_schema"])
+        self.assertNotIn("approval", recipe)
+        self.assertEqual(self.change("save_captured_source", **reference, **proposal)[0], 400)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js required for console rendering tests")
+    def test_recipe_rows_and_summary_render_before_expanding(self):
+        asset = Path(__file__).resolve().parents[1] / "src/wyrit/console/assets/console.js"
+        script = r"""
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const vm = require("node:vm");
+class Element {
+  children = [];
+  append(...children) { this.children.push(...children); }
+  replaceChildren(...children) { this.children = children; }
+  setAttribute() {}
+  addEventListener() {}
+}
+const panels = {recipes: new Element(), health: new Element()};
+const document = {createElement: () => new Element(), getElementById: id => panels[id]};
+const stats = {runs: 2, success_rate: .5, p50_duration: 1, p95_duration: 2};
+const recipes = [
+  {name: "publisher", state: "stale", reason: "Capability peer.publish changed or is unavailable.",
+    description: "Publish the approved update.", revision: "current", source: "return null;",
+    capabilities: {"peer.publish": {class: "write"}}, current_capabilities: {}, stats},
+  ...["pending", "runnable", "unapproved"].map(state => ({name: state, state, stats})),
+  {name: "pending-two", state: "pending", stats},
+];
+const context = vm.createContext({document, titles: {recipes: "Recipes"},
+  request: async () => ({recipes}), table: () => new Element()});
+const code = fs.readFileSync(process.argv[2], "utf8");
+const elements = code.slice(code.indexOf("function node("), code.indexOf("function table("));
+const render = code.slice(code.indexOf("async function renderRecipes("),
+  code.indexOf("document.querySelector('[data-target=\"recipes\"]')"));
+vm.runInContext(elements + render + "renderRecipes();", context).then(() => {
+  assert.deepEqual(panels.health.children.map(child => child.textContent),
+    ["Runnable 1", "Pending 2", "Unapproved 1", "Stale 1", "Needs review 4"]);
+  const [summary] = panels.recipes.children[0].children;
+  const [fields] = summary.children;
+  assert.deepEqual(fields.children.map(child => child.textContent), [
+    "publisher", "Stale", "Write", "2 runs · 50.0% succeeded",
+    "Capability peer.publish changed or is unavailable.", "Publish the approved update.",
+  ]);
+  assert.equal(fields.children[2].className, "write-badge");
+}).catch(error => { console.error(error); process.exitCode = 1; });
+"""
+        subprocess.run(["node", "-", str(asset)], input=script, text=True, check=True, capture_output=True)
+
     @unittest.skipUnless(shutil.which("node"), "Node.js is required for the feed rendering test")
     def test_run_row_is_collapsed_and_shows_first_source_line(self):
         asset = Path(__file__).resolve().parents[1] / "src/wyrit/console/assets/console.js"

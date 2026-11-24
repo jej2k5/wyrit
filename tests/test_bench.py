@@ -13,7 +13,8 @@ from mcp import ClientSession, types
 from bench.__main__ import ROOT, main
 from bench.agent import check_answer, create_server, run_agent
 from bench.clients import github_snapshot
-from bench.tasks import check, github_fixture, load_tasks
+from bench.generate_fan_out import generate
+from bench.tasks import GENERATED_MANIFEST, canonical, check, digest, github_fixture, load_tasks
 from native_support import require_native
 from src.wyrit.invocation import CallError
 from src.wyrit.native_sandbox import SandboxUnavailable
@@ -39,6 +40,27 @@ def answer(value, *, input_tokens=19):
 
 
 class BenchTests(unittest.TestCase):
+    def test_fan_out_generation_and_checked_in_manifest(self):
+        directory = ROOT / "tasks"
+        generated = list(generate())
+        self.assertEqual(generated, list(generate()))
+        manifest = json.loads((directory / GENERATED_MANIFEST).read_text())
+        self.assertEqual(manifest, {task["id"]: digest(task) for task in generated})
+        for path in directory.rglob("*"):
+            if path.is_file():
+                self.assertLessEqual(path.stat().st_size, 64 * 1024, path.name)
+        for task, minimum, maximum, comments in zip(generated, (1100, 5000), (1500, 7000), (3, 10)):
+            self.assertEqual(task, TASKS[task["id"]])
+            self.assertEqual(len(task["required_requests"]), 31)
+            for ticket in task["tools"]["get-ticket"]["cases"]:
+                self.assertEqual(len(ticket["result"]["comments"]), comments)
+                self.assertIn(len(canonical(ticket["result"])), range(minimum, maximum))
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / GENERATED_MANIFEST).write_text("{}")
+            with self.assertRaisesRegex(ValueError, "do not match"):
+                load_tasks(path)
+
     def test_answer_checker_accepts_only_json_or_a_standalone_fence(self):
         task = TASKS["failure-and-denial"]
         value = json.dumps(task["expected"])
@@ -211,32 +233,44 @@ class BenchTests(unittest.TestCase):
         self.assertEqual(main(["run", *options, "--calibration-id", "0" * 64], **inject), 1)
         model.assert_not_called()
         self.assertEqual(main(["calibrate", *options], **inject), 0)
-        self.assertEqual(model.call_count, 6)
+        self.assertEqual(model.call_count, 13)
         snapshot.assert_not_called()
         network.assert_not_called()
         calibration, = (output / "calibrations").glob("*.json")
         record = json.loads(calibration.read_text())
-        self.assertAlmostEqual(record["projected_cost_usd"], 0.00126)
-        self.assertIn("Projected cost for 12 runs", captured.getvalue())
+        self.assertAlmostEqual(record["projected_cost_usd"], 0.00291)
+        self.assertIn("Projected cost for 26 runs", captured.getvalue())
         self.assertIn("GITHUB_TOKEN is unset", captured.getvalue())
         self.assertEqual(main(["run", "--driver", "api", "--output", str(output), "--repetitions", "4",
                                "--calibration-id", calibration.stem], **inject), 1)
         self.assertEqual(main(["run", *options, "--calibration-id", calibration.stem],
                               **{**inject, "env": {"GITHUB_TOKEN": "test-token"}}), 1)
         snapshot.assert_not_called()
-        self.assertEqual(model.call_count, 6)
+        self.assertEqual(model.call_count, 13)
         self.assertEqual(main(["run", *options, "--calibration-id", calibration.stem], **inject), 0)
         report_path, = output.glob("run-*/report.json")
         report = json.loads(report_path.read_text())
-        self.assertEqual(len(report["runs"]), 12)
-        self.assertEqual(len(report["per_task"]), 3)
+        self.assertEqual(len(report["runs"]), 26)
+        self.assertEqual(len(report["per_task"]), 5)
+        self.assertEqual({row["task"] for row in report["runs"] if row["approach"] == "wyrit-recipe"},
+                         {"dependent-chain", "fan-out", "fan-out-large"})
+        chain = report["per_task"]["dependent-chain"]
+        self.assertAlmostEqual(chain["ratios_vs_direct"]["wyrit-recipe"]["cost_usd"], 1.8)
+        direct_time = chain["approaches"]["direct"]["metrics"]["wall_seconds"]["mean"]
+        for approach in ("wyrit", "wyrit-recipe"):
+            approach_time = chain["approaches"][approach]["metrics"]["wall_seconds"]["mean"]
+            self.assertAlmostEqual(chain["ratios_vs_direct"][approach]["wall_seconds"],
+                                   approach_time / direct_time)
+        self.assertIsNone(report["per_task"]["mismatches"]["ratios_vs_direct"]["wyrit-recipe"]["cost_usd"])
         overall = report["overall"]
         self.assertIn("input_tokens", overall["wyrit_losses"])
         self.assertEqual(overall["wyrit_minus_direct"]["input_tokens"], 20)
         self.assertEqual(overall["approaches"]["wyrit"]["metrics"]["input_tokens"]["variance"], 0)
         markdown = report_path.with_suffix(".md").read_text()
         self.assertIn("## failure-and-denial", markdown)
-        self.assertIn("Wyrit trails on input_tokens", markdown)
+        self.assertIn("Wyrit trails on", markdown)
+        self.assertIn("Wyrit-recipe mean", markdown)
+        self.assertIn("| wyrit-recipe | 1.800× |", markdown)
 
     def test_api_errors_keep_measured_usage_and_write_reports(self):
         def model(**request):

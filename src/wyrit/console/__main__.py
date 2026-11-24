@@ -161,20 +161,18 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         store = CaptureStore(monitor.path)
         if path in {"/api/source", "/api/captures"}:
             ref, = query.get("ref", [""])
-            if len(ref) > 20 or ref[:1] not in {"r", "h"} or not ref[1:].isascii() or not ref[1:].isdigit():
-                raise ConfigError("Choose a recorded source.")
-            if query.get("epoch") != [monitor.epoch]:
-                raise ConfigError("Refresh Monitoring to restore source links.")
-            record = monitor.source(ref)
-            if record is None:
-                raise ConfigError("Choose a recorded source.")
+            epoch, = query.get("epoch", [""])
+            record = self.monitor_record(monitor, ref, epoch)
             if path == "/api/source":
                 return record
             if not ref.startswith("r"):
                 raise ConfigError("Choose a run to view its captured payloads.")
             servers = self.server.capture_servers()
             run_id = record["record"]["run_id"]
-            return {"payloads": store.payloads(run_id, servers), "source": store.sources([run_id]).get(run_id)}
+            source = store.sources([run_id]).get(run_id)
+            return {"payloads": store.payloads(run_id, servers), "source": source,
+                    "can_save": source is not None and record["record"]["outcome"] == "SUCCESS"
+                    and host.recipes_enabled}
         window, = query.get("window", ["hour"])
         cursor, = query.get("after", ["0"])
         epoch, = query.get("epoch", [""])
@@ -201,6 +199,36 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         snapshot["health_record_error"] = host.health_record_error
         return snapshot
 
+    @staticmethod
+    def monitor_record(monitor, ref, epoch):
+        if (not isinstance(ref, str) or len(ref) > 20 or ref[:1] not in {"r", "h"}
+                or not ref[1:].isascii() or not ref[1:].isdigit()):
+            raise ConfigError("Choose a recorded source.")
+        if epoch != monitor.epoch:
+            raise ConfigError("Refresh Monitoring to restore source links.")
+        record = monitor.source(ref)
+        if record is None:
+            raise ConfigError("Choose a recorded source.")
+        return record
+
+    def save_captured_source(self, request):
+        monitor = self.server.monitoring()
+        ref = request.get("ref")
+        row = self.monitor_record(monitor, ref, request.get("epoch"))
+        record = row["record"]
+        run_id = request.get("run_id")
+        if not ref.startswith("r") or run_id != record.get("run_id") or record["outcome"] != "SUCCESS":
+            raise ConfigError("Choose a successful run with retained source.")
+        capture = CaptureStore(monitor.path).sources([run_id]).get(run_id)
+        if capture is None:
+            raise ConfigError("The source is no longer retained.")
+        proposal = (request.get("name"), request.get("description"), request.get("input_schema"),
+                    request.get("source", capture["text"]))
+        configuration = self.server.configuration
+        if _contains_secret(list(proposal), configuration.secrets):
+            raise ConfigError("Remove sensitive data before submitting for review.")
+        return configuration.host.propose_recipe(*proposal, None)
+
     def do_POST(self):
         if self.path != "/api/config":
             self.reply(404, {"error": "Use the configuration endpoint."})
@@ -224,15 +252,17 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
     def apply(self, request):
         action = request.get("action")
+        if action == "save_captured_source":
+            return self.save_captured_source(request)
         if action in {"approve_recipe", "revoke_recipe", "delete_recipe"}:
             if action == "delete_recipe" and request.get("confirm") is not True:
-                raise ConfigError("Confirm the recipe deletion.")
+                raise ConfigError("Confirm the deletion.")
             configuration = self.server.configuration
             configuration.host.change_recipe(
                 action.removesuffix("_recipe"), request.get("name"), request.get("revision"),
                 request.get("operator"), configuration.secrets,
             )
-            return {"message": "Recipe file updated."}
+            return {"message": "File updated."}
         if request.get("action") == "capture_status":
             servers = self.server.capture_servers()
             store = CaptureStore(self.server.configuration.host.ledger_path)

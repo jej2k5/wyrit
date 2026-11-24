@@ -2,10 +2,20 @@
 
 import hashlib
 import json
+from pathlib import Path
 import re
 
 from mcp import types
 from mcp.server.lowlevel import Server
+
+if __package__:
+    from .generate_fan_out import generate
+else:
+    from generate_fan_out import generate
+
+
+EMPTY_INPUT_SCHEMA = {"type": "object", "additionalProperties": False}
+GENERATED_MANIFEST = "fan-out.sha256.json"
 
 
 def canonical(value):
@@ -19,7 +29,10 @@ def digest(value):
 
 def load_tasks(directory):
     tasks = []
+    manifest = directory / GENERATED_MANIFEST
     for path in sorted(directory.glob("*.json")):
+        if path == manifest:
+            continue
         task = json.loads(path.read_text(encoding="utf-8"))
         if task["kind"] not in {"fixture", "github"} or not task["id"] or not task["prompt"]:
             raise ValueError(f"Invalid task in {path}")
@@ -32,6 +45,12 @@ def load_tasks(directory):
         else:
             task["contains"]
         tasks.append(task)
+    if manifest.exists() or directory.resolve() == Path(__file__).resolve().with_name("tasks"):
+        expected = json.loads(manifest.read_text(encoding="utf-8"))
+        generated = list(generate())
+        if {task["id"]: digest(task) for task in generated} != expected:
+            raise ValueError(f"Generated benchmark tasks do not match {manifest}")
+        tasks.extend(generated)
     if not tasks or len({task["id"] for task in tasks}) != len(tasks):
         raise ValueError("Provide a nonempty task suite with unique IDs")
     return tasks
@@ -75,9 +94,7 @@ def downstream_server(task, record, *, deny_writes_at_entry=False):
         return [
             types.Tool(
                 name=name, description=tool["description"],
-                inputSchema=tool.get("input_schema", {
-                    "type": "object", "additionalProperties": False,
-                }),
+                inputSchema=tool.get("input_schema", EMPTY_INPUT_SCHEMA),
                 annotations=types.ToolAnnotations(readOnlyHint=not tool.get("write", False)),
             )
             for name, tool in fixture.items()

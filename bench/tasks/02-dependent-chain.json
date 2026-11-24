@@ -33,5 +33,11 @@
     {"tool": "project-detail", "arguments": {"detail_key": "rk-904"}},
     {"tool": "project-detail", "arguments": {"detail_key": "rk-711"}}
   ],
-  "expected": {"project_count": 2, "billable_minutes": 213}
+  "expected": {"project_count": 2, "billable_minutes": 213},
+  "recipe": {
+    "name": "summarize-active-north-projects",
+    "description": "Count active projects in the north region and sum their billable minutes.",
+    "input_schema": {"type": "object", "additionalProperties": false},
+    "source": "const {projects} = await tools.call(\"bench.list-projects\", {});\nlet project_count = 0;\nlet billable_minutes = 0;\nfor (const project of projects) {\n    if (project.region !== \"north\" || project.status !== \"active\") continue;\n    const detail = await tools.call(\"bench.project-detail\", {detail_key: project.detail_key});\n    project_count++;\n    billable_minutes += detail.billable_minutes;\n}\nreturn {project_count, billable_minutes};"
+  }
 }

@@ -3,6 +3,7 @@ from io import StringIO
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 from tempfile import TemporaryDirectory
 import unittest
@@ -37,8 +38,11 @@ with capture.open("a") as stream:
 
 mode = os.environ.get("FAKE_MODE")
 server, = servers
+answer = {"read": "failed", "write": "denied"}
 assert args[args.index("--allowedTools") + 1] == f"mcp__{server}", args
 tools = ["read-status", "write-maintenance"] if server == "bench" else ["search", "execute"]
+if mode in {"recipe", "recipe-native"}:
+    tools = ["execute", "run_recipe", "search", "propose_recipe"]
 blocks = [{"type": "tool_use", "id": f"tool_{name}", "name": f"mcp__{server}__{name}"}
           for name in tools]
 print(json.dumps({"type": "assistant", "message": {"content": [
@@ -68,18 +72,30 @@ elif mode in {"recorded", "malformed-ledger", "permission-denial"}:
         "request": {"tool": "read-status", "arguments": {}},
         "outcome": {"tool": "read-status", "outcome": "FAILED"},
     }) + "\n")
-elif mode in {"mcp", "mcp-native"}:
+elif mode in {"mcp", "mcp-native", "recipe", "recipe-native"}:
     import anyio
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
 
     async def exercise():
+        global answer
         async with stdio_client(StdioServerParameters(**servers[server])) as streams:
             async with ClientSession(*streams) as session:
                 await session.initialize()
-                discovered = {tool.name for tool in (await session.list_tools()).tools}
-                assert discovered == set(tools), discovered
-                if server == "bench":
+                discovered = {tool.name: tool for tool in (await session.list_tools()).tools}
+                assert set(discovered) == set(tools), discovered
+                if mode in {"recipe", "recipe-native"}:
+                    name = os.environ["FAKE_RECIPE"]
+                    assert name in discovered["execute"].description, discovered
+                    if mode == "recipe":
+                        response = await session.call_tool("run_recipe", {"name": name, "arguments": {"extra": 1}})
+                        assert response.isError and "INVALID_ARGUMENTS" in response.content[0].text, response
+                    else:
+                        response = await session.call_tool("run_recipe", {"name": name, "arguments": {}})
+                        result = getattr(response, "structuredContent", None) or json.loads(response.content[0].text)
+                        assert result["status"] == "SUCCESS", result
+                        answer = result["value"]
+                elif server == "bench":
                     read = await session.call_tool("read-status", {})
                     write = await session.call_tool("write-maintenance", {})
                     assert read.isError and "Fixture tool failed" in read.content[0].text
@@ -108,7 +124,7 @@ print(json.dumps({
     "permission_denials": [{"tool_name": blocks[0]["name"], "tool_use_id": blocks[0]["id"]}]
                           if mode == "permission-denial" else [],
     "result": "Subscription usage limit reached" if mode == "limit"
-              else json.dumps({"read": "failed", "write": "denied"}),
+              else json.dumps(answer),
 }))
 """
 
@@ -300,3 +316,27 @@ class ClaudeCodeTests(unittest.TestCase):
                     self.assertNotIn("No downstream calls observed", stdout.getvalue())
                 self.assertNotIn("Calibration ID", stdout.getvalue())
                 self.assertFalse((output / "calibrations").exists())
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js required for fixture approval")
+    def test_recipe_is_discovered_and_admitted_through_allowed_mcp_server(self):
+        task = next(task for task in load_tasks(ROOT / "tasks") if task["id"] == "dependent-chain")
+        env = {**self.env, "FAKE_MODE": "recipe", "FAKE_RECIPE": task["recipe"]["name"]}
+        row = run_claude(task, "wyrit-recipe", self.settings, env)
+        self.assertIsNone(row["error"])
+        args = json.loads(self.capture.read_text())["args"]
+        self.assertEqual(args[args.index("-p") + 1], task["prompt"])
+        self.assertEqual(args[args.index("--allowedTools") + 1], "mcp__wyrit")
+        self.assertFalse(row["correct"])
+
+    def test_recipes_execute_with_real_sandbox_and_fixture(self):
+        require_native(self)
+        for task in load_tasks(ROOT / "tasks"):
+            if "recipe" not in task:
+                continue
+            with self.subTest(task=task["id"]):
+                env = {**self.env, "PATH": str(self.directory) + os.pathsep + os.environ["PATH"],
+                       "FAKE_MODE": "recipe-native", "FAKE_RECIPE": task["recipe"]["name"]}
+                row = run_claude(task, "wyrit-recipe", self.settings, env)
+                self.assertIsNone(row["error"])
+                self.assertEqual(row["downstream_calls"], len(task["required_requests"]))
+                self.assertTrue(row["correct"])

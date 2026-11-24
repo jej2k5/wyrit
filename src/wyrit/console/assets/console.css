@@ -71,6 +71,11 @@ main a { color: var(--accent); }
 #run-feed { border-top: 1px solid var(--line); }
 .run-row { border-bottom: 1px solid var(--line); padding: .5rem .3rem; }
 .run-row[open] { background: var(--panel); }
+.recipe-row { border-bottom: 1px solid var(--line); padding: .6rem .3rem; }
+.recipe-row[open] { background: var(--panel); }
+.recipe-fields { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: .35rem .9rem; width: calc(100% - 1.5rem); }
+.recipe-fields .wide { flex-basis: 100%; overflow-wrap: anywhere; }
+.write-badge { color: var(--warn); border: 1px solid currentColor; border-radius: 3px; padding: 0 .35rem; }
 .run-row > summary { white-space: nowrap; }
 .run-fields { display: inline-grid; width: calc(100% - 1.8rem); vertical-align: middle; gap: .65rem;
   grid-template-columns: max-content 7.25rem minmax(5rem, 1fr) max-content 5rem minmax(5rem, 1.4fr); }
