@@ -78,12 +78,10 @@ Authorization = { env = "WYRIT_PAIRING_CANARY", prefix = "Bearer " }
                 name = params["name"]
                 self.traffic.append((principal, "github", name))
                 if name == "create_issue":
-                    reply["error"] = {
-                        "code": -32003,
-                        "message": ("internal error" if params["arguments"].get("rpc_failure")
-                                    else "policy_blocked:write_denied"),
-                        "data": {"canary": self.secret},
-                    }
+                    code, text = params["arguments"].get("refusal") or (
+                        (-32003, "internal error") if params["arguments"].get("rpc_failure")
+                        else (-32003, "policy_blocked:write_denied"))
+                    reply["error"] = {"code": code, "message": text, "data": {"canary": self.secret}}
                 else:
                     value = self.secret if params["arguments"].get("echo_credential") else {"issues": [42]}
                     reply["result"] = {"content": [], "structuredContent": value}
@@ -123,6 +121,48 @@ Authorization = { env = "WYRIT_PAIRING_CANARY", prefix = "Bearer " }
             ("wyrit-test-client", "github", name)
             for name in ("list_issues", "create_issue", "list_issues", "create_issue")
         ])
+
+    def test_proxy_refusals_are_denials_with_reasons(self):
+        cases = [
+            ((-32003, "policy_blocked:write_denied"), "WRITE_POLICY", "WRITE_POLICY"),
+            ((-32003, "policy_blocked:tool_denied"), "TOOL_POLICY", "NOT_AUTHORIZED"),
+            ((-32003, "policy_blocked:method_denied"), "METHOD_POLICY", "NOT_AUTHORIZED"),
+            ((-32003, "policy_blocked:size_exceeded"), "SIZE_LIMIT", "NOT_AUTHORIZED"),
+            ((-32003, "policy_blocked:plan_cap_exceeded"), "PLAN_CAP", "NOT_AUTHORIZED"),
+            ((-32003, "policy_blocked:redaction_not_configured"), "REDACTION_REQUIRED", "NOT_AUTHORIZED"),
+            ((-32003, "policy_blocked:policy_resolver_error"), "POLICY_UNAVAILABLE", "NOT_AUTHORIZED"),
+            ((-32003, "token_mapping_not_found"), "CREDENTIAL_MAPPING", "NOT_AUTHORIZED"),
+            ((-32004, "upstream_not_authorized:github"), "UPSTREAM_NOT_AUTHORIZED", "NOT_AUTHORIZED"),
+            # Near misses and other proxy errors keep the cautious outcome.
+            ((-32000, "policy_blocked:write_denied"), None, None),
+            ((-32003, "policy_blocked:write_denied extra"), None, None),
+            ((-32003, "policy_blocked:something_new"), None, None),
+            ((-32004, "upstream_not_authorized:"), None, None),
+            ((-32001, "upstream_unavailable"), None, None),
+            ((-32002, "proxy_overloaded"), None, None),
+        ]
+        with configured_host(self.config) as host:
+            ids, dispatch = host.bind_run()
+            audit = []
+            protocol = InvocationProtocol(
+                "test", RunAuthorization("test", ids), dispatch=dispatch,
+                deadline=time.monotonic() + 5, audit=audit,
+            )
+            replies = [
+                protocol.respond({"run_id": "test", "call_id": index, "capability": "github.create_issue",
+                                  "args": {"refusal": list(refusal)}})
+                for index, (refusal, _, _) in enumerate(cases, 1)
+            ]
+        for (refusal, audit_reason, guest_reason), reply, row in zip(cases, replies, audit):
+            with self.subTest(refusal=refusal):
+                if audit_reason is None:
+                    self.assertEqual(reply["code"], "OUTCOME_UNKNOWN")
+                    self.assertEqual(row["outcome"], "UNKNOWN")
+                    self.assertNotIn("reason", row)
+                else:
+                    self.assertEqual((reply["code"], reply["reason"]), ("DENIED", guest_reason))
+                    self.assertEqual((row["outcome"], row["reason"]), ("DENIED", audit_reason))
+        self.assertNotIn(self.secret, json.dumps([replies, audit]))
 
     def test_native_guest_and_ledger(self):
         require_native(self)

@@ -67,4 +67,20 @@ Use your MCPxy HTTPS address and upstream slug in `/mcp/<upstream>`. Wyrit requi
 
 Check discovery in the console, then use `search` to get the tool ID and input schema before calling it with `execute`. Adjust `expose` to the tool names your upstream advertises. If the selected read tool lacks read-only annotations, verify its behavior and set `classification = "read"` in its per-tool configuration. Wyrit denies writes by default.
 
+MCPxy refuses some calls before it forwards them upstream. Wyrit records these as `DENIED` actions, and the ledger's `reason` shows why:
+
+| MCPxy error | Ledger reason |
+|---|---|
+| `policy_blocked:write_denied` | `WRITE_POLICY` |
+| `policy_blocked:tool_denied` | `TOOL_POLICY` |
+| `policy_blocked:method_denied` | `METHOD_POLICY` |
+| `policy_blocked:size_exceeded` | `SIZE_LIMIT` |
+| `policy_blocked:plan_cap_exceeded` | `PLAN_CAP` |
+| `policy_blocked:redaction_not_configured` | `REDACTION_REQUIRED` |
+| `policy_blocked:policy_resolver_error` | `POLICY_UNAVAILABLE` |
+| `token_mapping_not_found` | `CREDENTIAL_MAPPING` |
+| `upstream_not_authorized:<upstream>` | `UPSTREAM_NOT_AUTHORIZED` |
+
+Guest scripts see `error.reason` as `WRITE_POLICY` for a write refusal and `NOT_AUTHORIZED` for the others. Wyrit matches each refusal on its exact code and message. Any other error, including `upstream_unavailable` and `proxy_overloaded`, stays `OUTCOME_UNKNOWN`, because the request may already have reached the upstream.
+
 See the [phase handoff](HANDOFF_PHASE_20.md) for the live operator check.

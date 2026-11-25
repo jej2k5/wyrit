@@ -23,6 +23,29 @@ _SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
 _TOOL_NAME = re.compile(r"[A-Za-z0-9_.-]{1,128}")
 _NATIVE_NAME = re.compile(r"[a-z][a-z0-9_-]*")
 _ENCODED_PREFIX = "encoded-"
+# Refusals that MCPxy sends before forwarding a request upstream. Each one is
+# matched on its exact code and message, because servers reuse error codes;
+# anything else stays OUTCOME_UNKNOWN.
+_DOWNSTREAM_REFUSALS = {
+    (-32003, "policy_blocked:write_denied"): "WRITE_POLICY",
+    (-32003, "policy_blocked:tool_denied"): "TOOL_POLICY",
+    (-32003, "policy_blocked:method_denied"): "METHOD_POLICY",
+    (-32003, "policy_blocked:size_exceeded"): "SIZE_LIMIT",
+    (-32003, "policy_blocked:plan_cap_exceeded"): "PLAN_CAP",
+    (-32003, "policy_blocked:redaction_not_configured"): "REDACTION_REQUIRED",
+    (-32003, "policy_blocked:policy_resolver_error"): "POLICY_UNAVAILABLE",
+    (-32003, "token_mapping_not_found"): "CREDENTIAL_MAPPING",
+}
+_UPSTREAM_NOT_AUTHORIZED = re.compile(r"upstream_not_authorized:[A-Za-z0-9_.-]{1,128}")
+
+
+def _downstream_refusal(code, message):
+    """Return the audit reason for a known pre-forward refusal, or None."""
+    if not isinstance(message, str):
+        return None
+    if code == -32004 and _UPSTREAM_NOT_AUTHORIZED.fullmatch(message):
+        return "UPSTREAM_NOT_AUTHORIZED"
+    return _DOWNSTREAM_REFUSALS.get((code, message))
 
 
 def _contains_secret(value, secrets):
@@ -223,9 +246,9 @@ class MCPAdapter:
         except TimeoutError:
             raise CallError("CALL_TIMEOUT") from None
         except McpError as error:
-            # Match the explicit refusal, since server error codes can be reused.
-            if error.error.code == -32003 and error.error.message == "policy_blocked:write_denied":
-                raise CallError("DENIED", action_status="DENIED", audit_reason="WRITE_POLICY") from None
+            reason = _downstream_refusal(error.error.code, error.error.message)
+            if reason is not None:
+                raise CallError("DENIED", action_status="DENIED", audit_reason=reason) from None
             raise CallError("OUTCOME_UNKNOWN") from None
         except Exception:
             # The server may have acted even if the session reports an error.
